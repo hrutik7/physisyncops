@@ -1,0 +1,237 @@
+"use client";
+
+import { create } from "zustand";
+import { operationalState } from "@/lib/demo-data";
+import { Decision, DecisionState, OperationalState, TimelineEvent, UploadSource, MappingSuggestion } from "@/lib/types";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface OpentraStore extends OperationalState {
+  selectedDecisionId: string;
+  mappingOpen: boolean;
+  loading: boolean;
+  error: string | null;
+  taskStatus: string | null;
+  taskMeta: any;
+  selectedFile: File | null;
+  activeUploadSource: UploadSource;
+  uploadedColumns: string[];
+  
+  activeView: string;
+  setActiveView: (view: string) => void;
+  setSelectedDecision: (id: string) => void;
+  setMappingOpen: (open: boolean) => void;
+  updateDecisionState: (id: string, state: DecisionState) => void;
+  selectedDecision: () => Decision | undefined;
+  
+  // Asynchronous API Actions
+  setSelectedFile: (file: File | null) => void;
+  setActiveUploadSource: (source: UploadSource) => void;
+  loadInitialState: () => Promise<void>;
+  previewFile: (file: File, source: UploadSource) => Promise<void>;
+  confirmUpload: (mapping: Record<string, string>) => Promise<void>;
+  resetDatabase: () => Promise<void>;
+}
+
+function actionEvent(state: DecisionState): TimelineEvent {
+  const copy: Record<DecisionState, string> = {
+    pending: "Returned to pending",
+    monitoring: "User clicked Take Action",
+    verified: "Execution verified",
+    successful: "Marked successful",
+    unsuccessful: "Marked unsuccessful",
+    ignored: "User ignored decision",
+    snoozed: "User snoozed decision"
+  };
+
+  return {
+    id: `evt_${state}_${Date.now()}`,
+    time: "Now",
+    title: copy[state],
+    description: state === "monitoring" ? "Monitoring started. The next upload will verify downstream operational change." : "Decision state updated.",
+    kind: state === "monitoring" ? "human" : "system"
+  };
+}
+
+export const useOpentraStore = create<OpentraStore>((set, get) => ({
+  ...operationalState,
+  snapshots: [],
+  skus: [],
+  campaigns: [],
+  customerSegments: [],
+  creatives: [],
+  decisions: [],
+  selectedDecisionId: "",
+  mappingOpen: false,
+  loading: false,
+  error: null,
+  taskStatus: null,
+  taskMeta: null,
+  selectedFile: null,
+  activeUploadSource: "shopify_orders",
+  uploadedColumns: [],
+  activeView: "Decision Feed",
+
+  setActiveView: (view) => set({ activeView: view }),
+  setSelectedDecision: (id) => set({ selectedDecisionId: id }),
+  setMappingOpen: (open) => set({ mappingOpen: open }),
+  
+  updateDecisionState: (id, state) => {
+    // Optimistically update locally
+    set((current) => ({
+      decisions: current.decisions.map((decision) =>
+        decision.id === id
+          ? {
+              ...decision,
+              state,
+              timeline: [...decision.timeline, actionEvent(state)]
+            }
+          : decision
+      )
+    }));
+
+    // Perform API call to sync state
+    fetch(`${API_URL}/decisions/${id}/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state })
+    }).catch((err) => console.error("Failed to sync state to backend:", err));
+  },
+  
+  selectedDecision: () => get().decisions.find((decision) => decision.id === get().selectedDecisionId) || undefined,
+  
+  setSelectedFile: (file) => set({ selectedFile: file }),
+  setActiveUploadSource: (source) => set({ activeUploadSource: source }),
+  
+  loadInitialState: async () => {
+    set({ loading: true, error: null });
+    try {
+      const res = await fetch(`${API_URL}/state?brand_id=brand_unigo`);
+      if (!res.ok) throw new Error("Failed to load state from backend");
+      const data = await res.json();
+      set({
+        brandName: data.brandName,
+        snapshots: data.snapshots,
+        skus: data.skus,
+        campaigns: data.campaigns,
+        customerSegments: data.customerSegments,
+        creatives: data.creatives,
+        decisions: data.decisions,
+        loading: false
+      });
+      if (data.decisions && data.decisions.length > 0) {
+        set({ selectedDecisionId: data.decisions[0].id });
+      }
+    } catch (err: any) {
+      console.warn("Backend state unavailable, using local mock state:", err.message);
+      set({ loading: false }); // Fallback silently to mock data
+    }
+  },
+  
+  previewFile: async (file, source) => {
+    set({ loading: true, error: null, activeUploadSource: source, selectedFile: file });
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      
+      const res = await fetch(`${API_URL}/uploads/preview?brand_id=brand_unigo&upload_source=${source}`, {
+        method: "POST",
+        body: formData
+      });
+      if (!res.ok) throw new Error("Preview API failed");
+      const data = await res.json();
+      
+      set({
+        uploadedColumns: data.columns,
+        mappingSuggestions: data.suggestions,
+        mappingOpen: true,
+        loading: false
+      });
+    } catch (err: any) {
+      console.error(err);
+      set({ error: "Failed to generate column preview suggestions. Is the backend running?", loading: false });
+    }
+  },
+  
+  confirmUpload: async (mapping) => {
+    const file = get().selectedFile;
+    const source = get().activeUploadSource;
+    if (!file) {
+      set({ error: "No file selected for confirmation" });
+      return;
+    }
+    
+    set({ loading: true, error: null, taskStatus: "PENDING", taskMeta: null });
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("brand_id", "brand_unigo");
+      formData.append("upload_source", source);
+      formData.append("mapping", JSON.stringify(mapping));
+      
+      const res = await fetch(`${API_URL}/uploads/confirm`, {
+        method: "POST",
+        body: formData
+      });
+      if (!res.ok) throw new Error("Failed to submit confirm mapping");
+      
+      const data = await res.json();
+      const taskId = data.task_id;
+      
+      // Start background task polling
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API_URL}/uploads/status/${taskId}`);
+          if (!statusRes.ok) throw new Error("Polling status failed");
+          
+          const statusData = await statusRes.json();
+          if (statusData.status === "success") {
+            clearInterval(poll);
+            set({ taskStatus: "SUCCESS", loading: false, mappingOpen: false });
+            // Reload operational state with newly computed backend decisions
+            get().loadInitialState();
+          } else if (statusData.status === "failure") {
+            clearInterval(poll);
+            set({ error: `Task failed: ${statusData.error}`, loading: false, taskStatus: "FAILURE" });
+          } else if (statusData.status === "progress") {
+            set({ taskStatus: "PROGRESS", taskMeta: statusData.meta });
+          }
+        } catch (pollErr: any) {
+          clearInterval(poll);
+          set({ error: `Polling error: ${pollErr.message}`, loading: false, taskStatus: "FAILURE" });
+        }
+      }, 1000);
+      
+    } catch (err: any) {
+      console.error(err);
+      set({ error: `Upload confirmation failed: ${err.message}`, loading: false, taskStatus: "FAILURE" });
+    }
+  },
+
+  resetDatabase: async () => {
+    set({ loading: true, error: null });
+    try {
+      const res = await fetch(`${API_URL}/reset`, {
+        method: "POST"
+      });
+      if (!res.ok) throw new Error("Reset API failed");
+      
+      set({
+        snapshots: [],
+        skus: [],
+        campaigns: [],
+        customerSegments: [],
+        creatives: [],
+        decisions: [],
+        selectedDecisionId: "",
+        loading: false,
+        error: null,
+        taskStatus: null,
+        taskMeta: null
+      });
+    } catch (err: any) {
+      console.error(err);
+      set({ error: `Database reset failed: ${err.message}`, loading: false });
+    }
+  }
+}));
