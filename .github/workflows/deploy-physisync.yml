@@ -1,0 +1,67 @@
+# This GitHub Actions workflow builds the Docker image for the Physisync project,
+# pushes it to Amazon ECR in account 378457871865, and deploys it to an
+# Amazon ECS Fargate service.
+#
+# The workflow assumes you have added two repository secrets:
+#   AWS_ACCESS_KEY_ID_PHYSYNC
+#   AWS_SECRET_ACCESS_KEY_PHYSYNC
+#
+# It also expects an ECS task definition file at the repository root named
+# `ecs-task-def.json` (a minimal placeholder is created for you).
+# Adjust the region, repository name, cluster, service and roles as needed.
+
+name: Deploy Physisync to AWS (Fargate)
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: 378457871865.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/physisync
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (physisync-378 profile)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PHYSYNC }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PHYSYNC }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Optional: assume a role within the target account if you prefer
+          # role-to-assume: arn:aws:iam::378457871865:role/physisync-deployer
+          # role-duration-seconds: 900
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push Docker image to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./physisync
+          file: ./physisync/apps/web/Dockerfile
+          push: true
+          tags: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Deploy to ECS Fargate service
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ecs-task-def.json
+          service: physisync-service
+          cluster: physisync-cluster
+          wait-for-service-stability: true
+          image: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          launch-type: FARGATE
