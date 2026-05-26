@@ -123,8 +123,16 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
         set({ selectedDecisionId: data.decisions[0].id });
       }
     } catch (err: any) {
-      console.warn("Backend state unavailable, using local mock state:", err.message);
-      set({ loading: false }); // Fallback silently to mock data
+      // Backend unavailable — fall back to local mock data so the UI is functional
+      console.warn("Backend unavailable, loading mock data:", err.message);
+      set({
+        ...operationalState,
+        loading: false,
+        error: null
+      });
+      if (operationalState.decisions && operationalState.decisions.length > 0) {
+        set({ selectedDecisionId: operationalState.decisions[0].id });
+      }
     }
   },
   

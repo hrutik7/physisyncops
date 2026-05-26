@@ -274,16 +274,27 @@ def get_task_status(task_id: str) -> dict:
 
 @app.post("/decisions/{decision_id}/state")
 def update_decision_state(decision_id: str, payload: DecisionStateRequest, db: Session = Depends(get_db)) -> dict:
-    if payload.state not in {"monitoring", "ignored", "snoozed"}:
-        raise HTTPException(status_code=422, detail="Only Take Action, Ignore, and Snooze are human-controlled transitions.")
+    from sqlalchemy.orm.attributes import flag_modified
+    from datetime import datetime as dt
+
+    allowed = {"monitoring", "ignored", "snoozed", "verified", "successful", "unsuccessful"}
+    if payload.state not in allowed:
+        raise HTTPException(status_code=422, detail=f"State must be one of: {', '.join(allowed)}")
     decision = db.get(Decision, decision_id)
     if decision is None:
         raise HTTPException(status_code=404, detail="Decision not found")
     decision.state = payload.state
     decision.timeline = [
         *decision.timeline,
-        {"time": "now", "title": f"Decision moved to {payload.state}", "kind": "human"},
+        {
+            "id": f"evt_{payload.state}_{decision_id[:8]}",
+            "time": dt.now().strftime("%I:%M %p"),
+            "title": f"Decision moved to {payload.state}",
+            "description": "State updated by operator.",
+            "kind": "human"
+        },
     ]
+    flag_modified(decision, "timeline")
     db.commit()
     return {"decision_id": decision.id, "state": decision.state}
 

@@ -167,6 +167,11 @@ class SignalDetectionEngine:
                 base_conf = thresholds["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
+                # Business impact: revenue at risk = daily_velocity * projected_stockout_days * avg_order_value (proxy: contribution_margin_after_rto as % of 500 AOV)
+                daily_revenue = sku["daily_velocity"] * 500  # Rs 500 AOV proxy
+                revenue_at_risk = round(daily_revenue * min(sku["projected_stockout_days"], 7))
+                impact_label = f"Rs {revenue_at_risk:,.0f} revenue at risk over {sku['projected_stockout_days']} days"
+                
                 signals.append(
                     Signal(
                         title=f"{sku['name']} stockout risk in {sku['projected_stockout_days']} days",
@@ -174,8 +179,8 @@ class SignalDetectionEngine:
                         issue_type="Inventory pressure",
                         severity=thresholds["severity"],
                         confidence_score=conf_score,
-                        business_impact=148000,
-                        impact_label="Rs 1.48L revenue at risk over 72 hr",
+                        business_impact=revenue_at_risk,
+                        impact_label=impact_label,
                         recommendation="Reduce spend by 15% OR reorder within 48 hours",
                         affected_campaigns=sku.get("campaigns", []),
                         affected_skus=[sku["name"]],
@@ -217,6 +222,15 @@ class SignalDetectionEngine:
                 alignment = campaign["cod_ratio"] >= 50
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment)
                 
+                # Business impact: daily margin loss = spend * (1 - realized_roas/placed_roas) * margin%
+                daily_spend = campaign.get("spend", 0) / 7  # assume weekly spend
+                roas_placed = campaign.get("roas_on_placed_orders", 3.0)
+                roas_delivered = campaign.get("roas_on_delivered_orders", 2.0)
+                margin_pct = campaign.get("contribution_margin_after_rto", 10) / 100
+                daily_margin_loss = round(daily_spend * roas_placed * margin_pct * max(1 - roas_delivered / max(roas_placed, 0.01), 0))
+                daily_margin_loss = max(daily_margin_loss, 500)  # floor at Rs 500
+                impact_label = f"Losing Rs {daily_margin_loss:,.0f}/day in realized margin"
+                
                 signals.append(
                     Signal(
                         title=f"Pause {campaign['campaign_name']}",
@@ -224,9 +238,9 @@ class SignalDetectionEngine:
                         issue_type="Campaign-level RTO spike",
                         severity=thresholds["severity"],
                         confidence_score=conf_score,
-                        business_impact=6200,
-                        impact_label="Losing Rs 6,200/day in realized margin",
-                        recommendation=f"Pause {campaign['campaign_name']} immediately. Estimated daily margin loss: Rs 6,200",
+                        business_impact=daily_margin_loss,
+                        impact_label=impact_label,
+                        recommendation=f"Pause {campaign['campaign_name']} immediately. Estimated daily margin loss: Rs {daily_margin_loss:,.0f}",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=campaign.get("skus", []),
                         rule="campaign.rto_rate_attributed >= 25 AND campaign.cod_order_count >= 50",
@@ -237,9 +251,9 @@ class SignalDetectionEngine:
                             f"Contribution margin after RTO has compressed to {campaign.get('contribution_margin_after_rto', 10)}%"
                         ],
                         risk_projection=[
-                            {"horizon": "24 hr", "impact": "Rs 6,200 additional realized margin loss"},
-                            {"horizon": "48 hr", "impact": "Rs 12,400 loss and blended ROAS contamination"},
-                            {"horizon": "72 hr", "impact": "Rs 18,600 loss with COD RTO compounding"}
+                            {"horizon": "24 hr", "impact": f"Rs {daily_margin_loss:,.0f} additional realized margin loss"},
+                            {"horizon": "48 hr", "impact": f"Rs {daily_margin_loss*2:,.0f} loss and blended ROAS contamination"},
+                            {"horizon": "72 hr", "impact": f"Rs {daily_margin_loss*3:,.0f} loss with COD RTO compounding"}
                         ],
                         recommended_actions=["Pause campaign", "Shift budget to prepaid retargeting", "Add prepaid incentive for Tier 2 traffic"],
                         verification_signals=[
@@ -259,6 +273,12 @@ class SignalDetectionEngine:
                 base_conf = fatigue["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
+                # Business impact: spend efficiency at risk = weekly spend * ctr_drop_percent/100
+                weekly_spend = campaign.get("spend", 0)
+                ctr_drop = campaign["ctr_drop_percent"] / 100
+                spend_at_risk = round(weekly_spend * ctr_drop)
+                spend_at_risk = max(spend_at_risk, 1000)
+                
                 signals.append(
                     Signal(
                         title=f"Refresh {campaign['campaign_name']} creatives",
@@ -266,8 +286,8 @@ class SignalDetectionEngine:
                         issue_type="Creative fatigue",
                         severity=fatigue["severity"],
                         confidence_score=conf_score,
-                        business_impact=28000,
-                        impact_label="Rs 28K spend efficiency at risk",
+                        business_impact=spend_at_risk,
+                        impact_label=f"Rs {spend_at_risk:,.0f} spend efficiency at risk",
                         recommendation="Refresh creatives on flagged campaigns",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=campaign.get("skus", []),
@@ -302,6 +322,13 @@ class SignalDetectionEngine:
                 base_conf = leakage["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
+                # Business impact: margin leakage = matched campaign spend * rto_rate * avg_order_value_proxy
+                matching_camps = [c for c in campaigns if segment["name"].lower() in c["campaign_name"].lower() or c["campaign_name"].lower() in segment["name"].lower()]
+                total_spend = sum(c.get("spend", 0) for c in matching_camps) or 10000
+                rto_pct = segment["rto_rate_on_delivered"] / 100
+                margin_leakage = round(total_spend * rto_pct * 0.4)  # 40% of RTO-driven spend is margin loss
+                margin_leakage = max(margin_leakage, 2000)
+                
                 signals.append(
                     Signal(
                         title=f"Margin leakage in {segment['name']}",
@@ -309,8 +336,8 @@ class SignalDetectionEngine:
                         issue_type="Margin leakage",
                         severity=leakage["severity"],
                         confidence_score=conf_score,
-                        business_impact=24000,
-                        impact_label="Rs 24K margin leakage detected",
+                        business_impact=margin_leakage,
+                        impact_label=f"Rs {margin_leakage:,.0f} margin leakage detected",
                         recommendation="Pause or reduce COD-heavy campaigns. Push prepaid incentives.",
                         affected_campaigns=segment.get("campaigns", []),
                         affected_skus=segment.get("skus", [segment["name"]]),
@@ -351,16 +378,23 @@ class SignalDetectionEngine:
             
             # Check all ScalingOpportunity thresholds
             roas_deliv = campaign.get("roas_on_delivered_orders", 0.0)
-            rto_rate_attr = campaign.get("rto_rate_attributed", 0.0)
+            # Use rto_rate_on_delivered (order-level) for ScalingOpportunity, not rto_rate_attributed (campaign-level)
+            rto_rate_deliv = campaign.get("rto_rate_on_delivered", campaign.get("rto_rate_attributed", 0.0))
             margin = campaign.get("contribution_margin_after_rto", 0)
             
             if (roas_deliv >= opp["roas_on_delivered_orders_min"] and 
-                rto_rate_attr <= opp["rto_rate_on_delivered_max"] and 
+                rto_rate_deliv <= opp["rto_rate_on_delivered_max"] and 
+                repeat_rate >= opp["repeat_rate_min"] and
                 margin >= opp["contribution_margin_after_rto_min"] and 
                 projected_stockout >= opp["projected_stockout_days_min"]):
                 
                 base_conf = opp["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
+                
+                # Business impact: incremental revenue from 25% budget increase
+                weekly_spend = campaign.get("spend", 0)
+                incremental_revenue = round(weekly_spend * 0.25 * roas_deliv)
+                incremental_revenue = max(incremental_revenue, 5000)
                 
                 signals.append(
                     Signal(
@@ -369,16 +403,17 @@ class SignalDetectionEngine:
                         issue_type="Scaling opportunity",
                         severity=opp["severity"],
                         confidence_score=conf_score,
-                        business_impact=185000,
-                        impact_label="Rs 1.85L incremental revenue opportunity",
+                        business_impact=incremental_revenue,
+                        impact_label=f"Rs {incremental_revenue:,.0f} incremental revenue opportunity",
                         recommendation=f"Increase budget on {campaign['campaign_name']} by 25%. Metrics are highly profitable with low return rates.",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=skus_list,
-                        rule="roas_on_delivered_orders >= 4 AND rto_rate_attributed <= 7 AND contribution_margin >= 30 AND projected_stockout_days >= 14",
+                        rule="roas_on_delivered_orders >= 4 AND rto_rate_on_delivered <= 7 AND repeat_rate >= 25 AND contribution_margin >= 30 AND projected_stockout_days >= 14",
                         explanation="This campaign is driving highly profitable prepaid sales with low returns and has ample inventory cover to scale.",
                         cross_system_signals=[
                             f"Realized ROAS is {roas_deliv}x",
-                            f"RTO rate is {rto_rate_attr}%",
+                            f"RTO rate on delivered is {rto_rate_deliv}%",
+                            f"Repeat rate is {repeat_rate}%",
                             f"Inventory projected stockout is {projected_stockout} days",
                             f"Attributed contribution margin is {margin}%"
                         ],
