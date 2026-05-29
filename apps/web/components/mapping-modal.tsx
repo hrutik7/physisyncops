@@ -14,6 +14,7 @@ export function MappingModal() {
   const taskStatus = useOpentraStore((state) => state.taskStatus);
   const taskMeta = useOpentraStore((state) => state.taskMeta);
   const error = useOpentraStore((state) => state.error);
+  const brandName = useOpentraStore((state) => state.brandName);
 
   const [mappings, setMappings] = useState<Record<string, string>>({});
 
@@ -53,7 +54,7 @@ export function MappingModal() {
             </div>
             <div>
               <h2 className="text-lg font-semibold text-[#101426]">Confirm Column Mapping</h2>
-              <p className="mt-1 text-sm text-[#68708a]">Fuzzy matching suggests canonical fields, then stores this template for Unigo Footwear.</p>
+              <p className="mt-1 text-sm text-[#68708a]">Fuzzy matching suggests canonical fields, then stores this template for {brandName}.</p>
             </div>
           </div>
           <button

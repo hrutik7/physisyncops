@@ -75,3 +75,102 @@ class Decision(Base):
     relationship_edges: Mapped[list] = mapped_column(JSON, default=list)
 
     snapshot: Mapped[BusinessSnapshot] = relationship(back_populates="decisions")
+
+
+class Intervention(Base):
+    __tablename__ = "interventions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    decision_id: Mapped[str] = mapped_column(ForeignKey("decisions.id"), index=True)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    action_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="recommended")
+    expected_effect: Mapped[dict] = mapped_column(JSON, default=dict)
+    verification_metric: Mapped[dict] = mapped_column(JSON, default=dict)
+    outcome: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class UnitEconomics(Base):
+    __tablename__ = "unit_economics"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    sku_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    gross_margin_percent: Mapped[float] = mapped_column(Float, default=35)
+    shipping_cost: Mapped[float] = mapped_column(Float, default=0)
+    cod_fee: Mapped[float] = mapped_column(Float, default=0)
+    rto_cost: Mapped[float] = mapped_column(Float, default=0)
+    discount_cost: Mapped[float] = mapped_column(Float, default=0)
+    payment_gateway_cost: Mapped[float] = mapped_column(Float, default=0)
+    packaging_cost: Mapped[float] = mapped_column(Float, default=0)
+    average_order_value: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BrandGoal(Base):
+    __tablename__ = "brand_goals"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    goal_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=1)
+    target: Mapped[dict] = mapped_column(JSON, default=dict)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class OntologyNode(Base):
+    __tablename__ = "ontology_nodes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    entity_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    entity_key: Mapped[str] = mapped_column(String(200), index=True)
+    label: Mapped[str] = mapped_column(String(240), nullable=False)
+    properties: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class OntologyEdge(Base):
+    __tablename__ = "ontology_edges"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    from_key: Mapped[str] = mapped_column(String(200), index=True)
+    to_key: Mapped[str] = mapped_column(String(200), index=True)
+    label: Mapped[str] = mapped_column(String(240), nullable=False)
+    strength: Mapped[str] = mapped_column(String(24), default="medium")
+    source_decision_id: Mapped[str | None] = mapped_column(ForeignKey("decisions.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConnectorEvent(Base):
+    __tablename__ = "connector_events"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("business_snapshots.id"), index=True)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    entity_key: Mapped[str | None] = mapped_column(String(200), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class VerificationScorecard(Base):
+    __tablename__ = "verification_scorecards"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid)
+    intervention_id: Mapped[str] = mapped_column(ForeignKey("interventions.id"), index=True)
+    decision_id: Mapped[str] = mapped_column(ForeignKey("decisions.id"), index=True)
+    brand_id: Mapped[str] = mapped_column(ForeignKey("brands.id"), index=True)
+    score: Mapped[float] = mapped_column(Float, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    metrics: Mapped[list] = mapped_column(JSON, default=list)
+    summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

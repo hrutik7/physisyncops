@@ -105,7 +105,10 @@ export function DataSandbox() {
     setSuccess(false);
 
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/state/sandbox/update`, {
+      const sandboxUrl = new URL(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/state/sandbox/update`);
+      sandboxUrl.searchParams.set("brand_id", store.brandId);
+
+      const response = await fetch(sandboxUrl.toString(), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

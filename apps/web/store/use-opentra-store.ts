@@ -5,6 +5,7 @@ import { operationalState } from "@/lib/demo-data";
 import { Decision, DecisionState, OperationalState, TimelineEvent, UploadSource, MappingSuggestion } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const RESET_TOKEN = process.env.NEXT_PUBLIC_RESET_TOKEN;
 
 interface OpentraStore extends OperationalState {
   selectedDecisionId: string;
@@ -16,10 +17,12 @@ interface OpentraStore extends OperationalState {
   selectedFile: File | null;
   activeUploadSource: UploadSource;
   uploadedColumns: string[];
+  brandId: string;
   
   activeView: string;
   setActiveView: (view: string) => void;
   setSelectedDecision: (id: string) => void;
+  setBrandId: (id: string) => void;
   setMappingOpen: (open: boolean) => void;
   updateDecisionState: (id: string, state: DecisionState) => void;
   selectedDecision: () => Decision | undefined;
@@ -70,10 +73,15 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
   selectedFile: null,
   activeUploadSource: "shopify_orders",
   uploadedColumns: [],
+  brandId: typeof window !== "undefined" ? (localStorage.getItem("physisync_brand_id") || `brand_${Date.now()}`) : `brand_${Date.now()}`,
   activeView: "Decision Feed",
 
   setActiveView: (view) => set({ activeView: view }),
   setSelectedDecision: (id) => set({ selectedDecisionId: id }),
+  setBrandId: (id) => {
+    if (typeof window !== "undefined") localStorage.setItem("physisync_brand_id", id);
+    set({ brandId: id });
+  },
   setMappingOpen: (open) => set({ mappingOpen: open }),
   
   updateDecisionState: (id, state) => {
@@ -106,7 +114,7 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
   loadInitialState: async () => {
     set({ loading: true, error: null });
     try {
-      const res = await fetch(`${API_URL}/state?brand_id=brand_unigo`);
+      const res = await fetch(`${API_URL}/state?brand_id=${get().brandId}`);
       if (!res.ok) throw new Error("Failed to load state from backend");
       const data = await res.json();
       set({
@@ -142,7 +150,7 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
       const formData = new FormData();
       formData.append("file", file);
       
-      const res = await fetch(`${API_URL}/uploads/preview?brand_id=brand_unigo&upload_source=${source}`, {
+      const res = await fetch(`${API_URL}/uploads/preview?brand_id=${get().brandId}&upload_source=${source}`, {
         method: "POST",
         body: formData
       });
@@ -173,7 +181,7 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
     try {
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("brand_id", "brand_unigo");
+      formData.append("brand_id", get().brandId);
       formData.append("upload_source", source);
       formData.append("mapping", JSON.stringify(mapping));
       
@@ -185,10 +193,12 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
       
       const data = await res.json();
       const taskId = data.task_id;
+      let pollCount = 0;
       
       // Start background task polling
       const poll = setInterval(async () => {
         try {
+          pollCount += 1;
           const statusRes = await fetch(`${API_URL}/uploads/status/${taskId}`);
           if (!statusRes.ok) throw new Error("Polling status failed");
           
@@ -203,6 +213,13 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
             set({ error: `Task failed: ${statusData.error}`, loading: false, taskStatus: "FAILURE" });
           } else if (statusData.status === "progress") {
             set({ taskStatus: "PROGRESS", taskMeta: statusData.meta });
+          } else if (pollCount >= 60) {
+            clearInterval(poll);
+            set({
+              error: "Upload is still pending. Make sure the Celery worker is running, then upload again.",
+              loading: false,
+              taskStatus: "TIMEOUT"
+            });
           }
         } catch (pollErr: any) {
           clearInterval(poll);
@@ -219,10 +236,13 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
   resetDatabase: async () => {
     set({ loading: true, error: null });
     try {
-      const res = await fetch(`${API_URL}/reset`, {
+      const resetUrl = new URL(`${API_URL}/reset`);
+      if (RESET_TOKEN) resetUrl.searchParams.set("reset_token", RESET_TOKEN);
+
+      const res = await fetch(resetUrl.toString(), {
         method: "POST"
       });
-      if (!res.ok) throw new Error("Reset API failed");
+      if (!res.ok) throw new Error(res.status === 403 ? "Reset is locked. Configure RESET_TOKEN on the API and NEXT_PUBLIC_RESET_TOKEN in the web app." : "Reset API failed");
       
       set({
         snapshots: [],

@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import json
+import re
 from typing import Any
 from datetime import datetime, timezone
 
@@ -11,6 +12,20 @@ from .rules import SignalDetectionEngine, DataFreshnessValidator
 from .verification import MonitoringEngine
 from .demo_data import DEMO_STATE
 from .llm import LLMEnrichmentService
+from .operating_layer import (
+    ensure_default_goals,
+    ensure_intervention,
+    ensure_scorecard,
+    persist_connector_events,
+    persist_ontology,
+    upsert_unit_economics_from_state,
+)
+
+
+def display_name_from_brand_id(brand_id: str) -> str:
+    clean = re.sub(r"^brand[_-]?", "", brand_id).replace("_", " ").replace("-", " ").strip()
+    return clean.title() if clean else "Uploaded Brand"
+
 
 @celery_app.task(name="app.tasks.process_excel_upload_task", bind=True)
 def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: dict[str, str], file_path: str) -> dict:
@@ -39,7 +54,10 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         else:
             new_state = json.loads(json.dumps(DEMO_STATE))
             
-        new_state["brand_name"] = "Unigo Footwear"
+        if previous_snapshot is None:
+            new_state["brand_name"] = display_name_from_brand_id(brand_id)
+        else:
+            new_state["brand_name"] = new_state.get("brand_name") or display_name_from_brand_id(brand_id)
         
         # Check if the uploaded file is a custom brand upload by looking at its SKU names
         is_custom_upload = False
@@ -64,7 +82,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
 
         if is_custom_upload:
             print("🚀 [DYNAMIC INGESTION] Custom brand upload detected! Clearing Unigo mock data templates.", flush=True)
-            new_state["brand_name"] = "My E-commerce Brand"
+            new_state["brand_name"] = display_name_from_brand_id(brand_id)
             new_state["skus"] = []
             new_state["campaigns"] = []
             new_state["customer_segments"] = []
@@ -144,6 +162,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 spend_col = next((c for c in ads_df.columns if "spend" in c or "daily" in c or "amount" in c or "cost" in c), None)
                 roas_col = next((c for c in ads_df.columns if "roas" in c), None)
                 ctr_col = next((c for c in ads_df.columns if "ctr" in c or "percent" in c), None)
+                ctr_drop_col = next((c for c in ads_df.columns if "ctr" in c and ("drop" in c or "decay" in c or "change" in c)), None)
                 freq_col = next((c for c in ads_df.columns if "freq" in c), None)
                 
                 if camp_col:
@@ -157,6 +176,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             continue
                         
                         campaign = next((c for c in new_state["campaigns"] if c["campaign_name"].lower() == camp_name_str.lower() or c["campaign_id"].lower() == camp_name_str.lower() or c["campaign_id"].lower() == f"cmp_{camp_name_str.lower().replace(' ', '_')}"), None)
+                        has_prior_campaign = campaign is not None
                         if not campaign:
                             campaign = {
                                 "campaign_id": f"cmp_{camp_name_str.lower().replace(' ', '_')}",
@@ -165,8 +185,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "spend_growth_percent": 0,
                                 "roas_on_placed_orders": 3.0,
                                 "roas_on_delivered_orders": 2.0,
-                                "ctr": 1.5,
-                                "ctr_drop_percent": 5,
+                                "ctr": 0,
+                                "ctr_drop_percent": 0,
+                                "ctr_drop_source": "missing_baseline",
                                 "frequency": 2.5,
                                 "cod_order_count": 0,
                                 "cod_ratio": 40,
@@ -184,11 +205,15 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             if prev_spend > 0:
                                 campaign["spend_growth_percent"] = round(((campaign["spend"] - prev_spend) / prev_spend) * 100, 2)
                         if roas_col: campaign["roas_on_placed_orders"] = float(group[roas_col].mean())
-                        if ctr_col: 
-                            prev_ctr = campaign.get("ctr", 1.5)
+                        if ctr_drop_col:
+                            campaign["ctr_drop_percent"] = float(group[ctr_drop_col].mean())
+                            campaign["ctr_drop_source"] = ctr_drop_col
+                        if ctr_col:
+                            prev_ctr = campaign.get("ctr", 0)
                             campaign["ctr"] = float(group[ctr_col].mean())
-                            if prev_ctr > 0:
+                            if has_prior_campaign and prev_ctr > 0 and not ctr_drop_col:
                                 campaign["ctr_drop_percent"] = round(((prev_ctr - campaign["ctr"]) / prev_ctr) * 100, 2)
+                                campaign["ctr_drop_source"] = "previous_snapshot_ctr"
                         if freq_col: campaign["frequency"] = float(group[freq_col].mean())
                         
                         print(f"   📢 Campaign '{camp_name_str}': Total Spend=Rs {campaign['spend']} (Growth={campaign['spend_growth_percent']}%), Placed ROAS={campaign['roas_on_placed_orders']}x, CTR={campaign['ctr']}%, Freq={campaign['frequency']}", flush=True)
@@ -223,8 +248,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "prepaid_ratio": 50,
                                 "cod_ratio": 50,
                                 "repeat_rate": 15,
-                                "return_rate": 5,
-                                "rto_rate_on_delivered": 10,
+                                "return_rate": 0,
+                                "rto_rate_on_delivered": 0,
                                 "skus": [sku_name],
                                 "roas_on_placed_orders": 0.0
                             }
@@ -238,10 +263,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             new_state["customer_segments"].append(segment)
                             
                         if repeat_col and pd.notna(row[repeat_col]): segment["repeat_rate"] = float(row[repeat_col])
-                        if return_col and pd.notna(row[return_col]): segment["return_rate"] = float(row[return_col])
+                        if return_col and pd.notna(row[return_col]):
+                            segment["return_rate"] = float(row[return_col])
+                            if "rto" in return_col or "return" in return_col:
+                                segment["rto_rate_on_delivered"] = float(row[return_col])
                         if cod_col and pd.notna(row[cod_col]): 
                             segment["cod_ratio"] = float(row[cod_col])
-                            segment["rto_rate_on_delivered"] = float(row[cod_col]) * 0.45
                         if prepaid_col and pd.notna(row[prepaid_col]): segment["prepaid_ratio"] = float(row[prepaid_col])
                         
                         print(f"   👥 Customer Segment '{sku_name}': COD Mix={segment['cod_ratio']}%, Prepaid Mix={segment['prepaid_ratio']}%, Repeat Rate={segment['repeat_rate']}%, returnRate={segment['return_rate']}%", flush=True)
@@ -255,6 +282,13 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 
                 sku_col = next((c for c in orders_df.columns if "sku" in c or "variant" in c), None)
                 pm_col = next((c for c in orders_df.columns if "payment" in c or "mode" in c or "method" in c), None)
+                rto_col = next((c for c in orders_df.columns if "rto" in c or "returned" in c or "undelivered" in c), None)
+                delivered_col = next((c for c in orders_df.columns if "delivered" in c or "fulfilled" in c), None)
+                revenue_col = next((c for c in orders_df.columns if "revenue" in c or "total" in c or "amount" in c or "price" in c), None)
+                if revenue_col and len(orders_df) > 0:
+                    revenue_values = pd.to_numeric(orders_df[revenue_col], errors="coerce").dropna()
+                    if len(revenue_values) > 0:
+                        new_state["average_order_value"] = round(float(revenue_values.sum()) / len(orders_df), 2)
                 
                 if sku_col:
                     grouped = orders_df.groupby(sku_col)
@@ -269,6 +303,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             placed_count = len(group)
                             segment["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
                             segment["prepaid_ratio"] = 100 - segment["cod_ratio"]
+                        if segment and revenue_col:
+                            segment_revenue = pd.to_numeric(group[revenue_col], errors="coerce").sum()
+                            segment["average_order_value"] = round(float(segment_revenue) / max(len(group), 1), 2)
                             
                         for campaign in new_state.get("campaigns", []):
                             if sku_name_str.lower() in campaign["campaign_name"].lower() or campaign["campaign_name"].lower() in sku_name_str.lower():
@@ -276,9 +313,10 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum()) if pm_col else 0
                                 campaign["cod_order_count"] = cod_count
                                 campaign["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
-                                
-                                campaign["delivered_orders_attributed"] = int(placed_count * 0.75)
-                                campaign["rto_count_attributed"] = int(cod_count * 0.31)
+                                delivered_count = int(group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum()) if delivered_col else placed_count
+                                rto_count = int(group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum()) if rto_col else 0
+                                campaign["delivered_orders_attributed"] = delivered_count
+                                campaign["rto_count_attributed"] = rto_count
                                 if campaign["delivered_orders_attributed"] > 0:
                                     campaign["rto_rate_attributed"] = round((campaign["rto_count_attributed"] / campaign["delivered_orders_attributed"]) * 100, 2)
                                 
@@ -312,6 +350,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             freshness = DataFreshnessValidator.validate(df)
             
             if upload_source == "shopify_orders":
+                revenue_col = next((c for c in df_canonical.columns if c in {"revenue", "total", "amount", "price", "order_value"}), None)
+                if revenue_col and len(df_canonical) > 0:
+                    revenue_values = pd.to_numeric(df_canonical[revenue_col], errors="coerce").dropna()
+                    if len(revenue_values) > 0:
+                        new_state["average_order_value"] = round(float(revenue_values.sum()) / len(df_canonical), 2)
+
                 # Create segments and SKUs dynamically from the uploaded orders sheet
                 if "sku_id" in df_canonical.columns:
                     sku_grouped = df_canonical.groupby("sku_id")
@@ -458,12 +502,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "roas_on_delivered_orders": 2.0,
                                 "frequency": 1.0,
                                 "ctr_drop_percent": 0,
-                                "ctr": 1.0,
-                                "cod_order_count": 10,
-                                "cod_ratio": 30,
-                                "rto_count_attributed": 2,
-                                "delivered_orders_attributed": 15,
-                                "rto_rate_attributed": 13.3,
+                                "ctr": 0,
+                                "cod_order_count": 0,
+                                "cod_ratio": 0,
+                                "rto_count_attributed": 0,
+                                "delivered_orders_attributed": 0,
+                                "rto_rate_attributed": 0,
                                 "contribution_margin_after_rto": 25,
                                 "skus": []
                             }
@@ -477,10 +521,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         if "frequency" in df_canonical.columns:
                             campaign["frequency"] = float(row["frequency"])
                         if "ctr" in df_canonical.columns:
-                            prev_ctr = campaign.get("ctr", 1.5)
+                            prev_ctr = campaign.get("ctr", 0)
                             campaign["ctr"] = float(row["ctr"])
                             if prev_ctr > 0:
                                 campaign["ctr_drop_percent"] = round(((prev_ctr - campaign["ctr"]) / prev_ctr) * 100, 2)
+                                campaign["ctr_drop_source"] = "previous_snapshot_ctr"
                                 
             elif upload_source == "inventory":
                 if "sku_id" in df_canonical.columns:
@@ -514,9 +559,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         # Build / Verify Brand record exists
         brand = db.get(Brand, brand_id)
         if brand is None:
-            brand = Brand(id=brand_id, name="Unigo Footwear")
+            brand = Brand(id=brand_id, name=new_state.get("brand_name") or display_name_from_brand_id(brand_id))
             db.add(brand)
             db.flush()
+        else:
+            brand.name = new_state.get("brand_name") or brand.name
 
         # Dynamically calculate blended ROAS for all customer segments based on matched campaigns
         for segment in new_state.get("customer_segments", []):
@@ -538,10 +585,13 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             if matching_camps:
                 tot_spend = sum(c.get("spend", 0) for c in matching_camps)
                 tot_rev = sum(c.get("spend", 0) * c.get("roas_on_placed_orders", 0.0) for c in matching_camps)
+                tot_delivered_rev = sum(c.get("spend", 0) * c.get("roas_on_delivered_orders", 0.0) for c in matching_camps)
                 segment["roas_on_placed_orders"] = round(tot_rev / max(tot_spend, 1), 2) if tot_spend > 0 else 0.0
+                segment["roas_on_delivered_orders"] = round(tot_delivered_rev / max(tot_spend, 1), 2) if tot_spend > 0 else 0.0
                 print(f"   📊 [ROAS Sync] Segment '{seg_name}' matched {len(matching_camps)} campaigns. Blended Placed ROAS = {segment['roas_on_placed_orders']}x", flush=True)
             else:
                 segment["roas_on_placed_orders"] = 0.0
+                segment["roas_on_delivered_orders"] = 0.0
 
         # Dynamically calculate blended spend growth for all SKUs based on matched campaigns
         for sku in new_state.get("skus", []):
@@ -577,6 +627,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         )
         db.add(snapshot)
         db.flush()
+        ensure_default_goals(db, brand_id)
+        upsert_unit_economics_from_state(db, brand_id, new_state)
+        persist_connector_events(db, brand_id, snapshot, new_state)
         
         self.update_state(state="PROGRESS", meta={"step": "Running Monitoring & Verification Engine"})
         
@@ -643,6 +696,10 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 relationship_edges=enriched.get("relationship_edges", signal.relationship_edges)
             )
             db.add(decision)
+            db.flush()
+            persist_ontology(db, brand_id, decision)
+            intervention = ensure_intervention(db, brand_id, decision, "recommended")
+            ensure_scorecard(db, brand_id, decision, intervention, "pending")
             decisions_created += 1
             
         print("\n" + "=" * 80, flush=True)

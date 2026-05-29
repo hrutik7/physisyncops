@@ -140,6 +140,10 @@ export function DecisionFeed() {
   };
 
   const isBaseline = snapshots.length === 1 && snapshots[0].isBaseline;
+  const emptyTitle = isBaseline ? "Baseline Snapshot Ready" : "No Active Decisions";
+  const emptyCopy = isBaseline
+    ? "Your first upload established the operating baseline. Upload the next data refresh to compare changes, verify outcomes, and generate recommendations."
+    : "No decision rules are firing on the current data. Upload fresh orders, ads, or inventory data to keep monitoring active.";
 
   return (
     <section className="min-w-0 bg-[#fbfaff] px-6 py-7">
@@ -214,9 +218,9 @@ export function DecisionFeed() {
               <div className="grid h-16 w-16 place-items-center rounded-2xl bg-[#ecfff6] text-[#07824b] mb-4">
                 <Check className="h-8 w-8" />
               </div>
-              <h3 className="text-lg font-bold text-[#101426]">No Operational Risks Found</h3>
+              <h3 className="text-lg font-bold text-[#101426]">{emptyTitle}</h3>
               <p className="mt-2 text-sm text-[#68708a] max-w-sm leading-relaxed">
-                Your D2C brand metrics are looking completely optimized. No active campaign spikes, creative fatigue, or inventory stockout risks have been flagged.
+                {emptyCopy}
               </p>
             </div>
           ) : (

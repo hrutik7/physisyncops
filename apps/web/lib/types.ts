@@ -64,6 +64,8 @@ export interface CustomerSegment {
   repeatRate: number;
   returnRate: number;
   rtoRateOnDelivered: number;
+  roasOnPlacedOrders?: number;
+  roasOnDeliveredOrders?: number;
 }
 
 export interface Creative {
@@ -98,6 +100,30 @@ export interface RelationshipEdge {
   strength: "strong" | "medium" | "weak";
 }
 
+export interface Intervention {
+  id: string;
+  actionType: string;
+  status: string;
+  expectedEffect: Record<string, any>;
+  verificationMetric: Record<string, any>;
+  outcome: Record<string, any>;
+}
+
+export interface VerificationScorecard {
+  score: number;
+  status: string;
+  metrics: VerificationRule[];
+  summary: string | null;
+}
+
+export interface WhyAnalysis {
+  formula: string;
+  sourceFields: { source: string; field: string; value: string }[];
+  confidenceFactors: string[];
+  goalAlignment: string;
+  snapshotId: string;
+}
+
 export interface Decision {
   id: string;
   title: string;
@@ -121,6 +147,9 @@ export interface Decision {
   timeline: TimelineEvent[];
   confidenceExplanation: string;
   relationshipEdges: RelationshipEdge[];
+  whyAnalysis?: WhyAnalysis;
+  intervention?: Intervention | null;
+  verificationScorecard?: VerificationScorecard | null;
 }
 
 export interface OperationalState {

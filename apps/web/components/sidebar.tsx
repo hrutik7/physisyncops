@@ -49,7 +49,7 @@ export function Sidebar() {
         <div className="grid h-8 w-8 place-items-center rounded-lg bg-[#5b35d5] text-white">
           <Network size={18} />
         </div>
-        <span className="text-lg font-semibold text-[#101426]">Unigo Operator</span>
+        <span className="text-lg font-semibold text-[#101426]">Physisync</span>
       </div>
 
       <nav className="mt-10 space-y-1">

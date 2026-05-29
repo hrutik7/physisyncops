@@ -3,9 +3,11 @@ from typing import Any
 import pandas as pd
 from datetime import datetime, timezone
 
+DEFAULT_AVERAGE_ORDER_VALUE = 500
+
 SIGNAL_THRESHOLDS = {
     "InventoryRisk": {"projected_stockout_days_max": 7, "spend_growth_percent_min": 15, "severity": "high", "confidence": 0.82},
-    "CreativeFatigue": {"frequency_min": 4, "ctr_drop_percent_min": 20, "severity": "medium", "confidence": 0.76},
+    "CreativeFatigue": {"frequency_min": 4, "ctr_drop_percent_min": 20, "ctr_max_without_baseline": 0.8, "severity": "medium", "confidence": 0.76},
     "MarginLeakage": {"cod_ratio_min": 60, "rto_rate_on_delivered_min": 18, "roas_on_placed_orders_min": 3, "severity": "high", "confidence": 0.85},
     "CampaignRTOSpike": {"rto_rate_attributed_min": 25, "cod_order_count_min": 50, "severity": "high", "confidence": 0.88},
     "ScalingOpportunity": {
@@ -114,52 +116,82 @@ class ConfidenceEngine:
 
 class OntologyLayer:
     @staticmethod
-    def build_relationships(signal_type: str, entities: list[str]) -> list[dict[str, str]]:
+    def build_relationships(signal_type: str, entities: list[str], metrics: dict[str, Any] | None = None) -> list[dict[str, str]]:
+        metrics = metrics or {}
         edges = []
         if signal_type == "CampaignRTOSpike":
             campaign_name = entities[0] if entities else "Flagged Campaign"
+            cod_ratio = metrics.get("cod_ratio", 0)
+            realized_roas_value = metrics.get("roas_on_delivered_orders", 0)
+            margin = metrics.get("contribution_margin_after_rto", 0)
             edges = [
-                {"from": campaign_name, "to": "COD orders", "label": "drives 67% COD mix", "strength": "strong"},
+                {"from": campaign_name, "to": "COD orders", "label": f"drives {cod_ratio}% COD mix", "strength": "strong"},
                 {"from": "COD orders", "to": "RTO probability", "label": "elevates", "strength": "strong"},
-                {"from": "RTO probability", "to": "Realized ROAS", "label": "reduces to 2.1x", "strength": "strong"},
-                {"from": "Realized ROAS", "to": "Margin", "label": "compresses to 8%", "strength": "strong"}
+                {"from": "RTO probability", "to": "Realized ROAS", "label": f"reduces to {realized_roas_value}x", "strength": "strong"},
+                {"from": "Realized ROAS", "to": "Margin", "label": f"compresses to {margin}%", "strength": "strong"}
             ]
         elif signal_type == "InventoryRisk":
             sku_name = entities[0] if entities else "Flagged SKU"
+            campaign_name = entities[1] if len(entities) > 1 else "Matched campaign"
+            stockout_days = metrics.get("projected_stockout_days", 0)
             edges = [
-                {"from": "Velar-Static-V1", "to": f"{sku_name} velocity", "label": "drives demand", "strength": "strong"},
-                {"from": f"{sku_name} velocity", "to": "Inventory pressure", "label": f"{sku_name} stockout in 5 days", "strength": "strong"}
+                {"from": campaign_name, "to": f"{sku_name} velocity", "label": "drives demand", "strength": "strong"},
+                {"from": f"{sku_name} velocity", "to": "Inventory pressure", "label": f"{sku_name} stockout in {stockout_days} days", "strength": "strong"}
             ]
         elif signal_type == "CreativeFatigue":
             campaign_name = entities[0] if entities else "Flagged Campaign"
+            frequency = metrics.get("frequency", 0)
+            ctr_drop = metrics.get("ctr_drop_percent", 0)
             edges = [
-                {"from": campaign_name, "to": "Frequency", "label": "5.4 exposures", "strength": "strong"},
-                {"from": "Frequency", "to": "CTR", "label": "34% drop", "strength": "strong"},
+                {"from": campaign_name, "to": "Frequency", "label": f"{frequency} exposures", "strength": "strong"},
+                {"from": "Frequency", "to": "CTR", "label": f"{ctr_drop}% drop", "strength": "strong"},
                 {"from": "CTR", "to": "CAC stability", "label": "destabilizes", "strength": "medium"}
             ]
         elif signal_type == "ScalingOpportunity":
             campaign_name = entities[0] if entities else "Flagged Campaign"
+            rto_rate = metrics.get("rto_rate_on_delivered", 0)
+            roas = metrics.get("roas_on_delivered_orders", 0)
+            stockout_days = metrics.get("projected_stockout_days", 0)
             edges = [
-                {"from": "Prepaid audience", "to": "Low RTO", "label": "4% delivered-order RTO", "strength": "strong"},
-                {"from": "Low RTO", "to": "Realized ROAS", "label": "supports 5.1x", "strength": "strong"},
-                {"from": "Inventory cover", "to": "Scale safety", "label": "22 days available", "strength": "strong"}
+                {"from": campaign_name, "to": "Low RTO", "label": f"{rto_rate}% delivered-order RTO", "strength": "strong"},
+                {"from": "Low RTO", "to": "Realized ROAS", "label": f"supports {roas}x", "strength": "strong"},
+                {"from": "Inventory cover", "to": "Scale safety", "label": f"{stockout_days} days available", "strength": "strong"}
             ]
         elif signal_type == "MarginLeakage":
             segment_name = entities[0] if entities else "Flagged Segment"
+            cod_ratio = metrics.get("cod_ratio", 0)
+            rto_rate = metrics.get("rto_rate_on_delivered", 0)
             edges = [
-                {"from": segment_name, "to": "COD Mix", "label": "67% cash preference", "strength": "strong"},
-                {"from": "COD Mix", "to": "RTO Spike", "label": "erodes margin", "strength": "strong"}
+                {"from": segment_name, "to": "COD Mix", "label": f"{cod_ratio}% cash preference", "strength": "strong"},
+                {"from": "COD Mix", "to": "RTO Spike", "label": f"{rto_rate}% delivered-order RTO", "strength": "strong"}
             ]
         return edges
 
 
 class SignalDetectionEngine:
     @staticmethod
+    def average_order_value(state: dict[str, Any]) -> float:
+        configured = state.get("average_order_value") or state.get("aov")
+        if configured:
+            return float(configured)
+        return DEFAULT_AVERAGE_ORDER_VALUE
+
+    @staticmethod
+    def _matching_campaigns(entity_name: str, campaigns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        name = entity_name.lower()
+        return [
+            c for c in campaigns
+            if name in c.get("campaign_name", "").lower() or c.get("campaign_name", "").lower() in name
+        ]
+
+    @staticmethod
     def detect(state: dict[str, Any], freshness: float = 1.0) -> list[Signal]:
         signals: list[Signal] = []
         skus = state.get("skus", [])
         campaigns = state.get("campaigns", [])
         segments = state.get("customer_segments", [])
+        average_order_value = SignalDetectionEngine.average_order_value(state)
+        rto_spike_campaign_names: set[str] = set()
 
         for sku in skus:
             thresholds = SIGNAL_THRESHOLDS["InventoryRisk"]
@@ -167,8 +199,7 @@ class SignalDetectionEngine:
                 base_conf = thresholds["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
-                # Business impact: revenue at risk = daily_velocity * projected_stockout_days * avg_order_value (proxy: contribution_margin_after_rto as % of 500 AOV)
-                daily_revenue = sku["daily_velocity"] * 500  # Rs 500 AOV proxy
+                daily_revenue = sku["daily_velocity"] * average_order_value
                 revenue_at_risk = round(daily_revenue * min(sku["projected_stockout_days"], 7))
                 impact_label = f"Rs {revenue_at_risk:,.0f} revenue at risk over {sku['projected_stockout_days']} days"
                 
@@ -210,26 +241,28 @@ class SignalDetectionEngine:
                             }
                         ],
                         confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("InventoryRisk", [sku["name"]])
+                        relationship_edges=OntologyLayer.build_relationships("InventoryRisk", [sku["name"], *(sku.get("campaigns", [])[:1])], sku)
                     )
                 )
 
         for campaign in campaigns:
             thresholds = SIGNAL_THRESHOLDS["CampaignRTOSpike"]
             if campaign["rto_rate_attributed"] >= thresholds["rto_rate_attributed_min"] and campaign["cod_order_count"] >= thresholds["cod_order_count_min"]:
+                rto_spike_campaign_names.add(campaign["campaign_name"])
                 base_conf = thresholds["confidence"]
                 # Cross system alignment confirmed if COD ratio is also elevated
                 alignment = campaign["cod_ratio"] >= 50
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment)
                 
-                # Business impact: daily margin loss = spend * (1 - realized_roas/placed_roas) * margin%
-                daily_spend = campaign.get("spend", 0) / 7  # assume weekly spend
+                # Business impact: realized margin delta from placed-order ROAS to delivered-order ROAS.
+                # Treat spend as the uploaded window; most current POC sheets use daily spend.
+                spend = campaign.get("spend", 0)
                 roas_placed = campaign.get("roas_on_placed_orders", 3.0)
                 roas_delivered = campaign.get("roas_on_delivered_orders", 2.0)
                 margin_pct = campaign.get("contribution_margin_after_rto", 10) / 100
-                daily_margin_loss = round(daily_spend * roas_placed * margin_pct * max(1 - roas_delivered / max(roas_placed, 0.01), 0))
-                daily_margin_loss = max(daily_margin_loss, 500)  # floor at Rs 500
-                impact_label = f"Losing Rs {daily_margin_loss:,.0f}/day in realized margin"
+                realized_margin_loss = round(spend * max(roas_placed - roas_delivered, 0) * margin_pct)
+                impact_formula = f"Rs {spend:,.0f} spend x ({roas_placed} placed ROAS - {roas_delivered} delivered ROAS) x {campaign.get('contribution_margin_after_rto', 10)}% margin"
+                impact_label = f"Rs {realized_margin_loss:,.0f} realized margin leakage"
                 
                 signals.append(
                     Signal(
@@ -238,9 +271,9 @@ class SignalDetectionEngine:
                         issue_type="Campaign-level RTO spike",
                         severity=thresholds["severity"],
                         confidence_score=conf_score,
-                        business_impact=daily_margin_loss,
+                        business_impact=realized_margin_loss,
                         impact_label=impact_label,
-                        recommendation=f"Pause {campaign['campaign_name']} immediately. Estimated daily margin loss: Rs {daily_margin_loss:,.0f}",
+                        recommendation=f"Pause {campaign['campaign_name']} immediately. Estimated realized margin leakage: Rs {realized_margin_loss:,.0f}",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=campaign.get("skus", []),
                         rule="campaign.rto_rate_attributed >= 25 AND campaign.cod_order_count >= 50",
@@ -248,12 +281,13 @@ class SignalDetectionEngine:
                         cross_system_signals=[
                             f"COD ratio is {campaign['cod_ratio']}% on the flagged audience",
                             f"Placed-order ROAS is {campaign.get('roas_on_placed_orders', 3.0)}x, but realized ROAS is only {campaign.get('roas_on_delivered_orders', 2.0)}x",
-                            f"Contribution margin after RTO has compressed to {campaign.get('contribution_margin_after_rto', 10)}%"
+                            f"Contribution margin after RTO has compressed to {campaign.get('contribution_margin_after_rto', 10)}%",
+                            f"Impact formula: {impact_formula} = Rs {realized_margin_loss:,.0f}"
                         ],
                         risk_projection=[
-                            {"horizon": "24 hr", "impact": f"Rs {daily_margin_loss:,.0f} additional realized margin loss"},
-                            {"horizon": "48 hr", "impact": f"Rs {daily_margin_loss*2:,.0f} loss and blended ROAS contamination"},
-                            {"horizon": "72 hr", "impact": f"Rs {daily_margin_loss*3:,.0f} loss with COD RTO compounding"}
+                            {"horizon": "24 hr", "impact": f"Rs {realized_margin_loss:,.0f} additional realized margin loss"},
+                            {"horizon": "48 hr", "impact": f"Rs {realized_margin_loss*2:,.0f} loss and blended ROAS contamination"},
+                            {"horizon": "72 hr", "impact": f"Rs {realized_margin_loss*3:,.0f} loss with COD RTO compounding"}
                         ],
                         recommended_actions=["Pause campaign", "Shift budget to prepaid retargeting", "Add prepaid incentive for Tier 2 traffic"],
                         verification_signals=[
@@ -264,20 +298,36 @@ class SignalDetectionEngine:
                             }
                         ],
                         confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("CampaignRTOSpike", [campaign["campaign_name"]])
+                        relationship_edges=OntologyLayer.build_relationships("CampaignRTOSpike", [campaign["campaign_name"]], campaign)
                     )
                 )
 
             fatigue = SIGNAL_THRESHOLDS["CreativeFatigue"]
-            if campaign["frequency"] >= fatigue["frequency_min"] and campaign["ctr_drop_percent"] >= fatigue["ctr_drop_percent_min"]:
+            ctr_drop_source = campaign.get("ctr_drop_source")
+            has_ctr_baseline = ctr_drop_source not in {None, "", "missing_baseline"}
+            ctr = campaign.get("ctr", 0)
+            decay_triggered = has_ctr_baseline and campaign["ctr_drop_percent"] >= fatigue["ctr_drop_percent_min"]
+            low_ctr_triggered = not has_ctr_baseline and ctr > 0 and ctr <= fatigue["ctr_max_without_baseline"]
+            if campaign["frequency"] >= fatigue["frequency_min"] and (decay_triggered or low_ctr_triggered):
                 base_conf = fatigue["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
-                # Business impact: spend efficiency at risk = weekly spend * ctr_drop_percent/100
-                weekly_spend = campaign.get("spend", 0)
-                ctr_drop = campaign["ctr_drop_percent"] / 100
-                spend_at_risk = round(weekly_spend * ctr_drop)
-                spend_at_risk = max(spend_at_risk, 1000)
+                spend = campaign.get("spend", 0)
+                if decay_triggered:
+                    # Business impact: uploaded-window spend multiplied by the observed CTR decay factor.
+                    ctr_drop = campaign["ctr_drop_percent"] / 100
+                    spend_at_risk = max(round(spend * ctr_drop), 1000)
+                    impact_label = f"Rs {spend_at_risk:,.0f} spend efficiency at risk"
+                    impact_formula = f"Rs {spend:,.0f} spend x {campaign['ctr_drop_percent']}% CTR decay = Rs {spend_at_risk:,.0f}"
+                    business_impact = spend_at_risk
+                    rule = "frequency >= 4 AND ctr_drop_percent >= 20"
+                    trigger_signal = f"CTR has decayed by {campaign['ctr_drop_percent']}% from {ctr_drop_source}"
+                else:
+                    impact_label = f"Creative review: {ctr}% CTR at {campaign['frequency']} frequency; ROAS {campaign.get('roas_on_placed_orders', 0.0)}x holding"
+                    impact_formula = "No rupee loss assigned because no CTR baseline/decay column was provided"
+                    business_impact = None
+                    rule = "frequency >= 4 AND ctr <= 0.8 with no CTR baseline"
+                    trigger_signal = f"CTR is below {fatigue['ctr_max_without_baseline']}% review threshold; no historical decay was provided"
                 
                 signals.append(
                     Signal(
@@ -286,17 +336,19 @@ class SignalDetectionEngine:
                         issue_type="Creative fatigue",
                         severity=fatigue["severity"],
                         confidence_score=conf_score,
-                        business_impact=spend_at_risk,
-                        impact_label=f"Rs {spend_at_risk:,.0f} spend efficiency at risk",
+                        business_impact=business_impact,
+                        impact_label=impact_label,
                         recommendation="Refresh creatives on flagged campaigns",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=campaign.get("skus", []),
-                        rule="frequency >= 4 AND ctr_drop_percent >= 20",
-                        explanation="Frequency is high while CTR has dropped sharply.",
+                        rule=rule,
+                        explanation="Frequency is high and CTR quality requires creative review. If ROAS is holding, refresh creatives rather than pausing the campaign.",
                         cross_system_signals=[
                             f"CTR is {campaign.get('ctr', 1.5)}%",
                             f"Frequency is {campaign['frequency']}",
-                            f"CTR has decayed by {campaign['ctr_drop_percent']}% versus last week"
+                            trigger_signal,
+                            f"ROAS is {campaign.get('roas_on_placed_orders', 0.0)}x on placed orders",
+                            f"Impact formula: {impact_formula}"
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": "CAC instability likely begins"},
@@ -312,41 +364,47 @@ class SignalDetectionEngine:
                             }
                         ],
                         confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("CreativeFatigue", [campaign["campaign_name"]])
+                        relationship_edges=OntologyLayer.build_relationships("CreativeFatigue", [campaign["campaign_name"]], campaign)
                     )
                 )
 
         for segment in segments:
             leakage = SIGNAL_THRESHOLDS["MarginLeakage"]
             if segment["cod_ratio"] >= leakage["cod_ratio_min"] and segment["rto_rate_on_delivered"] >= leakage["rto_rate_on_delivered_min"] and segment.get("roas_on_placed_orders", 0.0) >= leakage["roas_on_placed_orders_min"]:
+                matching_camps = SignalDetectionEngine._matching_campaigns(segment["name"], campaigns)
+                if any(c.get("campaign_name") in rto_spike_campaign_names for c in matching_camps):
+                    continue
                 base_conf = leakage["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
-                # Business impact: margin leakage = matched campaign spend * rto_rate * avg_order_value_proxy
-                matching_camps = [c for c in campaigns if segment["name"].lower() in c["campaign_name"].lower() or c["campaign_name"].lower() in segment["name"].lower()]
+                # Business impact: matched campaign spend x blended ROAS x RTO rate x margin.
                 total_spend = sum(c.get("spend", 0) for c in matching_camps) or 10000
                 rto_pct = segment["rto_rate_on_delivered"] / 100
-                margin_leakage = round(total_spend * rto_pct * 0.4)  # 40% of RTO-driven spend is margin loss
+                roas = segment.get("roas_on_delivered_orders") or segment.get("roas_on_placed_orders", 0.0)
+                margin_pct = (sum(c.get("contribution_margin_after_rto", 25) for c in matching_camps) / max(len(matching_camps), 1)) / 100
+                margin_leakage = round(total_spend * roas * rto_pct * margin_pct)
                 margin_leakage = max(margin_leakage, 2000)
+                impact_formula = f"Rs {total_spend:,.0f} matched spend x {roas} delivered ROAS x {segment['rto_rate_on_delivered']}% RTO x {round(margin_pct * 100, 1)}% margin"
                 
                 signals.append(
                     Signal(
-                        title=f"Margin leakage in {segment['name']}",
+                        title=f"Margin leakage on {segment['name']}",
                         signal_type="MarginLeakage",
                         issue_type="Margin leakage",
                         severity=leakage["severity"],
                         confidence_score=conf_score,
                         business_impact=margin_leakage,
                         impact_label=f"Rs {margin_leakage:,.0f} margin leakage detected",
-                        recommendation="Pause or reduce COD-heavy campaigns. Push prepaid incentives.",
+                        recommendation="Reduce COD-heavy demand and push prepaid incentives.",
                         affected_campaigns=segment.get("campaigns", []),
                         affected_skus=segment.get("skus", [segment["name"]]),
                         rule="cod_ratio >= 60 AND rto_rate_on_delivered >= 18 AND roas_on_placed_orders >= 3",
-                        explanation="Topline ROAS looks healthy but realized profitability is eroding due to high COD RTO.",
+                        explanation="Topline ROAS looks healthy but realized profitability is eroding due to high COD/RTO behavior on this SKU.",
                         cross_system_signals=[
                             f"COD ratio is {segment['cod_ratio']}%",
                             f"RTO rate on delivered is {segment['rto_rate_on_delivered']}%",
-                            f"ROAS on placed orders is {segment.get('roas_on_placed_orders', 0.0)}x"
+                            f"ROAS on placed orders is {segment.get('roas_on_placed_orders', 0.0)}x",
+                            f"Impact formula: {impact_formula} = Rs {margin_leakage:,.0f}"
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": "Margin compression continues"},
@@ -356,7 +414,7 @@ class SignalDetectionEngine:
                         recommended_actions=["De-prioritize COD prospecting", "Shift budget to prepaid segments", "Incentivize UPI payment method"],
                         verification_signals=[],
                         confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("MarginLeakage", [segment["name"]])
+                        relationship_edges=OntologyLayer.build_relationships("MarginLeakage", [segment["name"]], segment)
                     )
                 )
 
@@ -425,7 +483,15 @@ class SignalDetectionEngine:
                         recommended_actions=["Increase budget by 20-30%", "Incentivize high-LTV segment retargeting", "Maintain current creative flow"],
                         verification_signals=[],
                         confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("ScalingOpportunity", [campaign["campaign_name"]])
+                        relationship_edges=OntologyLayer.build_relationships(
+                            "ScalingOpportunity",
+                            [campaign["campaign_name"]],
+                            {
+                                **campaign,
+                                "rto_rate_on_delivered": rto_rate_deliv,
+                                "projected_stockout_days": projected_stockout,
+                            },
+                        )
                     )
                 )
 

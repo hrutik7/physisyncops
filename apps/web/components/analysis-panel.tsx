@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ArrowRight, Check, Circle, PackageOpen, TrendingUp, X } from "lucide-react";
+import { ArrowRight, Check, Circle, Eye, PackageOpen, TrendingUp, X } from "lucide-react";
 import { useOpentraStore } from "@/store/use-opentra-store";
 import { Decision, Severity } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -27,7 +27,7 @@ const severityTone: Record<Severity, string> = {
   low: "border-[#c8f3df] bg-[#ecfff6] text-[#07824b]"
 };
 
-const executionSignals = [
+const defaultExecutionSignals = [
   { label: "Ad spend reduced by >15%", progress: 84, done: true },
   { label: "Velar reorder placed", progress: 0, done: false },
   { label: "Inventory incoming", progress: 0, done: false },
@@ -56,12 +56,30 @@ export function AnalysisPanel() {
     );
   }
   const Icon = iconBySignal[decision.signalType as keyof typeof iconBySignal] || PackageOpen;
+  const executionSignals = decision.verificationScorecard?.metrics?.length
+    ? decision.verificationScorecard.metrics.map((metric) => ({
+        label: metric.label,
+        progress: decision.verificationScorecard?.status === "successful" ? 100 : 0,
+        done: decision.verificationScorecard?.status === "successful"
+      }))
+    : defaultExecutionSignals;
 
   return (
     <aside className="thin-scrollbar h-screen overflow-y-auto border-l border-[#ebe8f5] bg-white p-4">
       <div className="rounded-xl border border-[#e6e8f0] bg-white shadow-[0_18px_55px_rgba(38,35,64,0.06)]">
         <div className="flex items-center justify-between border-b border-[#edf0f6] px-4 py-4">
-          <h2 className="text-base font-semibold text-[#101426]">Decision Details</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-base font-semibold text-[#101426]">Decision Details</h2>
+            <button
+              type="button"
+              aria-label="View Full Analysis"
+              title="View Full Analysis"
+              onClick={() => setShowModal(true)}
+              className="grid h-8 w-8 place-items-center rounded-lg text-[#68708a] hover:bg-[#f7f5ff] hover:text-[#4320c2] transition-colors animate-in fade-in duration-200"
+            >
+              <Eye size={18} />
+            </button>
+          </div>
           <button
             type="button"
             aria-label="Close details"
@@ -89,9 +107,37 @@ export function AnalysisPanel() {
           <div className="mt-5 space-y-4 border-y border-[#edf0f6] py-4">
             <DetailRow label="Potential Impact" value={compactImpact(decision)} />
             <DetailRow label="Confidence" value={`${Math.round(decision.confidenceScore * 100)}%`} />
+            <DetailRow label="Goal Alignment" value={decision.whyAnalysis?.goalAlignment?.replaceAll("_", " ") || "margin"} />
+            <DetailRow label="Action Object" value={decision.intervention ? `${decision.intervention.actionType.replaceAll("_", " ")} / ${decision.intervention.status}` : "recommended"} />
             <DetailRow label="Recommended Action" value={decision.recommendation} />
             <DetailRow label="Detected" value={decision.timestamp === "10:02 AM" ? "2h ago" : decision.timestamp} />
           </div>
+
+          <section className="mt-5 rounded-xl border border-[#edf0f6] bg-[#fcfcff] p-4">
+            <h4 className="text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">Why This Decision?</h4>
+            <div className="mt-3 space-y-3">
+              <div>
+                <p className="text-xs font-semibold text-[#68708a]">Formula</p>
+                <code className="mt-1 block rounded-lg border border-[#e6e8f0] bg-white px-3 py-2 text-xs font-semibold text-[#101426]">
+                  {decision.whyAnalysis?.formula || decision.rule}
+                </code>
+              </div>
+              <div className="grid gap-2">
+                {(decision.whyAnalysis?.sourceFields || []).slice(0, 4).map((field, idx) => (
+                  <div key={`${field.field}-${idx}`} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-xs">
+                    <span className="font-medium text-[#4f5872]">{field.source}</span>
+                    <span className="text-right font-semibold text-[#101426]">{field.value}</span>
+                  </div>
+                ))}
+              </div>
+              {decision.verificationScorecard ? (
+                <div className="rounded-lg border border-[#dbe7ff] bg-[#f0f5ff] px-3 py-2 text-xs text-[#185be8]">
+                  Verification scorecard: <span className="font-bold">{decision.verificationScorecard.status}</span>
+                  {decision.verificationScorecard.summary ? ` - ${decision.verificationScorecard.summary}` : ""}
+                </div>
+              ) : null}
+            </div>
+          </section>
 
           <section className="mt-5">
             <h4 className="text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">Status Timeline</h4>
@@ -169,7 +215,7 @@ export function AnalysisPanel() {
       </div>
 
       <div className="mt-4 rounded-xl border border-[#e6e8f0] bg-white p-4 shadow-[0_18px_55px_rgba(38,35,64,0.06)]">
-        <h4 className="text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">Execution Signals (2/5)</h4>
+        <h4 className="text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">Verification Scorecard</h4>
         <div className="mt-4 space-y-4">
           {executionSignals.map((signal) => (
             <div key={signal.label} className="grid grid-cols-[1fr_20px] items-center gap-3">
@@ -191,15 +237,6 @@ export function AnalysisPanel() {
             </div>
           ))}
         </div>
-
-        <button 
-          type="button" 
-          onClick={() => setShowModal(true)}
-          className="mt-5 flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-[#f0ebff] text-sm font-semibold text-[#4320c2] transition hover:bg-[#e7e1fe]"
-        >
-          View Full Analysis
-          <ArrowRight size={17} />
-        </button>
       </div>
 
       {/* Premium Analysis Diagnostic Modal */}
@@ -269,9 +306,11 @@ export function AnalysisPanel() {
                     <div>
                       <h5 className="text-sm font-bold text-[#101426]">Cross-System Correlation</h5>
                       <p className="text-sm text-[#4f5872] mt-1">
-                        PhysiSync identified that {decision.title.toLowerCase().includes("stockout") 
+                        PhysiSync identified that {decision.title.toLowerCase().includes("stockout")
                           ? "elevated traffic and marketing spend growth intersect critically with limited product availability on Shopify. This creates a high risk of burning budget on advertising out-of-stock inventory."
-                          : "specific marketing campaigns are driving disproportionate Cash on Delivery (COD) order count on paper, but an alarming ratio of these are returning (RTO) before final delivery."
+                          : decision.signalType === "CreativeFatigue"
+                            ? "ad exposure frequency has crossed the fatigue threshold while a supported CTR decay signal is present. This points to creative saturation rather than a logistics or RTO issue."
+                            : "specific marketing campaigns are driving disproportionate Cash on Delivery (COD) order count on paper, but an alarming ratio of these are returning (RTO) before final delivery."
                         }
                       </p>
                     </div>

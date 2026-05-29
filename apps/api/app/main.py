@@ -13,7 +13,28 @@ from pydantic import BaseModel
 from .db import Base, engine, get_db
 from .demo_data import DEMO_STATE
 from .mapping import suggest_mappings
-from .models import Brand, BusinessSnapshot, Decision, MappingTemplate
+from .models import (
+    Brand,
+    BrandGoal,
+    BusinessSnapshot,
+    ConnectorEvent,
+    Decision,
+    Intervention,
+    MappingTemplate,
+    OntologyEdge,
+    OntologyNode,
+    UnitEconomics,
+    VerificationScorecard,
+)
+from .operating_layer import (
+    ensure_default_goals,
+    ensure_intervention,
+    ensure_scorecard,
+    persist_connector_events,
+    persist_ontology,
+    upsert_unit_economics_from_state,
+    why_analysis,
+)
 from .rules import detect_signals, SignalDetectionEngine
 from .verification import infer_execution, MonitoringEngine
 from .schemas import ConfirmMappingRequest, DecisionStateRequest, SnapshotResponse, UploadPreviewResponse
@@ -29,6 +50,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def display_name_from_brand_id(brand_id: str) -> str:
+    clean = re.sub(r"^brand[_-]?", "", brand_id).replace("_", " ").replace("-", " ").strip()
+    return clean.title() if clean else "Uploaded Brand"
 
 
 @app.on_event("startup")
@@ -48,7 +74,7 @@ def demo() -> dict:
 
 
 @app.get("/state")
-def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
+def get_state(brand_id: str, db: Session = Depends(get_db)):
     # Query latest snapshot
     snapshot = db.scalars(
         select(BusinessSnapshot)
@@ -57,8 +83,9 @@ def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
     ).first()
     
     if snapshot is None:
+        brand = db.get(Brand, brand_id)
         return {
-            "brandName": "Unigo Footwear",
+            "brandName": brand.name if brand else display_name_from_brand_id(brand_id),
             "snapshots": [],
             "skus": [],
             "campaigns": [],
@@ -93,6 +120,10 @@ def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
         
     dec_list = []
     for d in decisions:
+        intervention = db.query(Intervention).filter_by(decision_id=d.id).first()
+        scorecard = None
+        if intervention:
+            scorecard = db.query(VerificationScorecard).filter_by(intervention_id=intervention.id).first()
         dec_list.append({
             "id": d.id,
             "title": d.title,
@@ -115,7 +146,22 @@ def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
             "verificationSignals": d.verification_signals,
             "timeline": d.timeline,
             "confidenceExplanation": d.confidence_explanation or "",
-            "relationshipEdges": d.relationship_edges
+            "relationshipEdges": d.relationship_edges,
+            "whyAnalysis": why_analysis(d, snapshot),
+            "intervention": {
+                "id": intervention.id,
+                "actionType": intervention.action_type,
+                "status": intervention.status,
+                "expectedEffect": intervention.expected_effect,
+                "verificationMetric": intervention.verification_metric,
+                "outcome": intervention.outcome,
+            } if intervention else None,
+            "verificationScorecard": {
+                "score": scorecard.score,
+                "status": scorecard.status,
+                "metrics": scorecard.metrics,
+                "summary": scorecard.summary,
+            } if scorecard else None,
         })
         
     for d in dec_list:
@@ -130,7 +176,8 @@ def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
         elif d["issueType"] == "Scaling opportunity":
             d["signalType"] = "ScalingOpportunity"
             
-    brand_name = snapshot.state.get("brand_name", "Unigo Footwear") if snapshot else "Unigo Footwear"
+    brand = db.get(Brand, brand_id)
+    brand_name = snapshot.state.get("brand_name") or (brand.name if brand else display_name_from_brand_id(brand_id))
     return {
         "brandName": brand_name,
         "snapshots": [
@@ -186,7 +233,9 @@ def get_state(brand_id: str = "brand_unigo", db: Session = Depends(get_db)):
                 "codRatio": s.get("cod_ratio", 50),
                 "repeatRate": s.get("repeat_rate", 15),
                 "returnRate": s.get("return_rate", 5),
-                "rtoRateOnDelivered": s.get("rto_rate_on_delivered", 10)
+                "rtoRateOnDelivered": s.get("rto_rate_on_delivered", 10),
+                "roasOnPlacedOrders": s.get("roas_on_placed_orders", 0.0),
+                "roasOnDeliveredOrders": s.get("roas_on_delivered_orders", 0.0)
             }
             for i, s in enumerate(snapshot.state.get("customer_segments", []))
         ],
@@ -295,6 +344,10 @@ def update_decision_state(decision_id: str, payload: DecisionStateRequest, db: S
         },
     ]
     flag_modified(decision, "timeline")
+    snapshot = db.get(BusinessSnapshot, decision.snapshot_id)
+    if snapshot:
+        intervention = ensure_intervention(db, snapshot.brand_id, decision, "in_progress" if payload.state == "monitoring" else payload.state)
+        ensure_scorecard(db, snapshot.brand_id, decision, intervention, "pending")
     db.commit()
     return {"decision_id": decision.id, "state": decision.state}
 
@@ -305,7 +358,10 @@ def compare_snapshots(previous: dict | None, latest: dict) -> dict:
 
 
 @app.post("/reset")
-def reset_database(db: Session = Depends(get_db)) -> dict:
+def reset_database(reset_token: str | None = None, db: Session = Depends(get_db)) -> dict:
+    configured_token = os.getenv("RESET_TOKEN")
+    if not configured_token or reset_token != configured_token:
+        raise HTTPException(status_code=403, detail="Reset endpoint is locked")
     db.query(Decision).delete()
     db.query(BusinessSnapshot).delete()
     db.query(Brand).delete()
@@ -319,12 +375,111 @@ class SandboxUpdatePayload(BaseModel):
     customerSegments: list
 
 
+class UnitEconomicsPayload(BaseModel):
+    skuId: str | None = None
+    grossMarginPercent: float = 35
+    shippingCost: float = 0
+    codFee: float = 0
+    rtoCost: float = 0
+    discountCost: float = 0
+    paymentGatewayCost: float = 0
+    packagingCost: float = 0
+    averageOrderValue: float | None = None
+
+
+class GoalPayload(BaseModel):
+    goalType: str
+    priority: int = 1
+    target: dict = {}
+    active: bool = True
+
+
+@app.get("/brands/{brand_id}/operating-layer")
+def get_operating_layer(brand_id: str, db: Session = Depends(get_db)) -> dict:
+    brand = db.get(Brand, brand_id)
+    if brand is None:
+        brand = Brand(id=brand_id, name=display_name_from_brand_id(brand_id))
+        db.add(brand)
+        db.flush()
+    ensure_default_goals(db, brand_id)
+    db.commit()
+    economics = db.query(UnitEconomics).filter(UnitEconomics.brand_id == brand_id).all()
+    goals = db.query(BrandGoal).filter(BrandGoal.brand_id == brand_id).order_by(BrandGoal.priority.asc()).all()
+    nodes = db.query(OntologyNode).filter(OntologyNode.brand_id == brand_id).all()
+    edges = db.query(OntologyEdge).filter(OntologyEdge.brand_id == brand_id).order_by(OntologyEdge.created_at.desc()).limit(100).all()
+    events = db.query(ConnectorEvent).filter(ConnectorEvent.brand_id == brand_id).order_by(ConnectorEvent.created_at.desc()).limit(100).all()
+
+    return {
+        "goals": [{"id": g.id, "goalType": g.goal_type, "priority": g.priority, "target": g.target, "active": g.active} for g in goals],
+        "unitEconomics": [
+            {
+                "id": e.id,
+                "skuId": e.sku_id,
+                "grossMarginPercent": e.gross_margin_percent,
+                "shippingCost": e.shipping_cost,
+                "codFee": e.cod_fee,
+                "rtoCost": e.rto_cost,
+                "discountCost": e.discount_cost,
+                "paymentGatewayCost": e.payment_gateway_cost,
+                "packagingCost": e.packaging_cost,
+                "averageOrderValue": e.average_order_value,
+            }
+            for e in economics
+        ],
+        "ontology": {
+            "nodes": [{"id": n.id, "entityType": n.entity_type, "entityKey": n.entity_key, "label": n.label, "properties": n.properties} for n in nodes],
+            "edges": [{"id": e.id, "fromKey": e.from_key, "toKey": e.to_key, "label": e.label, "strength": e.strength, "sourceDecisionId": e.source_decision_id} for e in edges],
+        },
+        "events": [{"id": e.id, "source": e.source, "eventType": e.event_type, "entityKey": e.entity_key, "occurredAt": e.occurred_at.isoformat(), "payload": e.payload} for e in events],
+    }
+
+
+@app.post("/brands/{brand_id}/unit-economics")
+def upsert_unit_economics(brand_id: str, payload: UnitEconomicsPayload, db: Session = Depends(get_db)) -> dict:
+    brand = db.get(Brand, brand_id)
+    if brand is None:
+        brand = Brand(id=brand_id, name=display_name_from_brand_id(brand_id))
+        db.add(brand)
+        db.flush()
+    economics = db.query(UnitEconomics).filter(UnitEconomics.brand_id == brand_id, UnitEconomics.sku_id == payload.skuId).first()
+    if economics is None:
+        economics = UnitEconomics(brand_id=brand_id, sku_id=payload.skuId)
+        db.add(economics)
+    economics.gross_margin_percent = payload.grossMarginPercent
+    economics.shipping_cost = payload.shippingCost
+    economics.cod_fee = payload.codFee
+    economics.rto_cost = payload.rtoCost
+    economics.discount_cost = payload.discountCost
+    economics.payment_gateway_cost = payload.paymentGatewayCost
+    economics.packaging_cost = payload.packagingCost
+    economics.average_order_value = payload.averageOrderValue
+    db.commit()
+    return {"status": "success", "id": economics.id}
+
+
+@app.post("/brands/{brand_id}/goals")
+def upsert_goal(brand_id: str, payload: GoalPayload, db: Session = Depends(get_db)) -> dict:
+    brand = db.get(Brand, brand_id)
+    if brand is None:
+        brand = Brand(id=brand_id, name=display_name_from_brand_id(brand_id))
+        db.add(brand)
+        db.flush()
+    goal = db.query(BrandGoal).filter(BrandGoal.brand_id == brand_id, BrandGoal.goal_type == payload.goalType).first()
+    if goal is None:
+        goal = BrandGoal(brand_id=brand_id, goal_type=payload.goalType)
+        db.add(goal)
+    goal.priority = payload.priority
+    goal.target = payload.target
+    goal.active = payload.active
+    db.commit()
+    return {"status": "success", "id": goal.id}
+
+
 @app.post("/state/sandbox/update")
-def update_state_sandbox(payload: SandboxUpdatePayload, db: Session = Depends(get_db)):
+def update_state_sandbox(payload: SandboxUpdatePayload, brand_id: str, db: Session = Depends(get_db)):
     from datetime import datetime
     import json
     
-    brand_id = "brand_unigo"
     previous_snapshot = db.query(BusinessSnapshot).filter(
         BusinessSnapshot.brand_id == brand_id
     ).order_by(BusinessSnapshot.snapshot_version.desc()).first()
@@ -339,7 +494,18 @@ def update_state_sandbox(payload: SandboxUpdatePayload, db: Session = Depends(ge
     else:
         new_state = json.loads(json.dumps(DEMO_STATE))
         
-    new_state["brand_name"] = "Unigo Footwear"
+    if previous_snapshot is None:
+        new_state["brand_name"] = display_name_from_brand_id(brand_id)
+    else:
+        new_state["brand_name"] = new_state.get("brand_name") or display_name_from_brand_id(brand_id)
+
+    brand = db.get(Brand, brand_id)
+    if brand is None:
+        brand = Brand(id=brand_id, name=new_state["brand_name"])
+        db.add(brand)
+        db.flush()
+    else:
+        brand.name = new_state["brand_name"]
     
     # Map SKUs
     new_state["skus"] = []
@@ -396,7 +562,9 @@ def update_state_sandbox(payload: SandboxUpdatePayload, db: Session = Depends(ge
             "cod_ratio": float(s.get("codRatio", s.get("cod_ratio", 50))),
             "repeat_rate": float(s.get("repeatRate", s.get("repeat_rate", 15))),
             "return_rate": float(s.get("returnRate", s.get("return_rate", 5))),
-            "rto_rate_on_delivered": float(s.get("rtoRateOnDelivered", s.get("rto_rate_on_delivered", 10)))
+            "rto_rate_on_delivered": float(s.get("rtoRateOnDelivered", s.get("rto_rate_on_delivered", 10))),
+            "roas_on_placed_orders": float(s.get("roasOnPlacedOrders", s.get("roas_on_placed_orders", 0.0))),
+            "roas_on_delivered_orders": float(s.get("roasOnDeliveredOrders", s.get("roas_on_delivered_orders", 0.0)))
         })
         
     # Create snapshot
@@ -409,6 +577,9 @@ def update_state_sandbox(payload: SandboxUpdatePayload, db: Session = Depends(ge
     )
     db.add(snapshot)
     db.flush()
+    ensure_default_goals(db, brand_id)
+    upsert_unit_economics_from_state(db, brand_id, new_state)
+    persist_connector_events(db, brand_id, snapshot, new_state)
     
     # Run Monitoring verification engine
     previous_state = previous_snapshot.state if previous_snapshot else None
@@ -472,6 +643,10 @@ def update_state_sandbox(payload: SandboxUpdatePayload, db: Session = Depends(ge
             relationship_edges=enriched.get("relationship_edges", signal.relationship_edges)
         )
         db.add(decision)
+        db.flush()
+        persist_ontology(db, brand_id, decision)
+        intervention = ensure_intervention(db, brand_id, decision, "recommended")
+        ensure_scorecard(db, brand_id, decision, intervention, "pending")
         
     db.commit()
     return {"status": "success", "snapshot_id": snapshot.id}

@@ -16,6 +16,7 @@ Operational observability for Indian D2C brands.
 
 ```bash
 npm install
+npm run dev:infra
 npm run dev
 ```
 
@@ -24,11 +25,12 @@ Open `http://localhost:3000`.
 ## Run backend
 
 ```bash
-docker compose up -d
+npm run dev:infra
+cd apps/api
 python3 -m venv .venv
 .venv/bin/activate
-pip install -r backend/requirements.txt
-uvicorn backend.app.main:app --reload --port 8000
+pip install -r requirements.txt
+npm run dev
 ```
 
 API health check: `http://localhost:8000/health`.
@@ -53,4 +55,3 @@ Users can now upload Excel files directly without selecting a source type. The s
 
 ### Multi-Sheet Uploads
 You can include multiple sheets in a single Excel file (e.g., Shopify Orders, Meta Ads, and Inventory all in one workbook). The system will process each sheet according to its name.
-

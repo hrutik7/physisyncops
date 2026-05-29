@@ -198,14 +198,15 @@ class LLMEnrichmentService:
             }
             
         elif signal.signal_type == "CreativeFatigue":
+            roas_signal = next((s for s in signal.cross_system_signals if "ROAS is" in s), "")
             return {
                 "title": f"Refresh Campaign Creatives: High ad exposure frequency on {campaign}",
                 "explanation": (
                     f"Ad frequency within campaign {campaign} has reached saturated exposure thresholds. "
-                    f"This overexposure has resulted in creative fatigue, driving click-through rates (CTR) down "
-                    f"significantly. As a result, the cost-per-acquisition (CPA) is climbing, leading to inefficient spend."
+                    f"CTR decay indicates creative fatigue, but {roas_signal or 'ROAS may still be holding'}. "
+                    f"This is a refresh decision, not a pause decision: keep the campaign economics under review while rotating creative."
                 ),
-                "recommendation": "Launch fresh creative variations and refresh active hooks to revive viewer engagement.",
+                "recommendation": "Launch fresh creative variations and refresh active hooks; do not pause unless delivered ROAS also falls below target.",
                 "confidence_explanation": (
                     "Dynamic analysis confirms ad frequency exceeds 4.0 exposures and click-through rates "
                     "have experienced a steep decay of 20% compared to baseline averages."
@@ -229,13 +230,13 @@ class LLMEnrichmentService:
             
         elif signal.signal_type == "MarginLeakage":
             return {
-                "title": f"Margin Alert: COD leakage in customer segment '{sku}'",
+                "title": f"Margin Alert: COD leakage on {sku}",
                 "explanation": (
-                    f"The customer cohort for '{sku}' is heavily favoring Cash-on-Delivery (COD) orders over "
-                    f"prepaid options. While topline numbers look positive, high return rates for cash delivery "
+                    f"Orders for {sku} are heavily favoring Cash-on-Delivery (COD) over prepaid options. "
+                    f"While topline numbers look positive, high return rates for cash delivery "
                     f"are absorbing potential profits, leading to major margin leakage."
                 ),
-                "recommendation": "Incentivize digital and UPI payment options at checkout for this specific segment.",
+                "recommendation": "Incentivize digital and UPI payment options at checkout for this SKU and reduce COD-heavy demand.",
                 "confidence_explanation": (
                     "Heuristics confirm segment cash preference exceeds 60% and return-on-delivered "
                     "metrics indicate severe profit erosion."
@@ -251,7 +252,7 @@ class LLMEnrichmentService:
                     {"horizon": "72 hr", "impact": "Segment profit contribution erodes completely, leaving zero net return"}
                 ],
                 "relationship_edges": [
-                    {"from": f"Segment {sku}", "to": "COD Preference", "label": "prefers cash on delivery", "strength": "strong"},
+                    {"from": sku, "to": "COD Preference", "label": "prefers cash on delivery", "strength": "strong"},
                     {"from": "COD Preference", "to": "Returned Shipments", "label": "drives return risk", "strength": "strong"},
                     {"from": "Returned Shipments", "to": "Net Margin", "label": "compresses returns cost", "strength": "strong"}
                 ]

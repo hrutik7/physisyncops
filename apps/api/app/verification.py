@@ -17,7 +17,7 @@ class MonitoringEngine:
         verification_signals conditions against the new data.
         """
         if db_session is not None:
-            from .models import Decision, BusinessSnapshot
+            from .models import Decision, BusinessSnapshot, Intervention, VerificationScorecard
             from sqlalchemy import select
 
             # Only check decisions already in 'monitoring' state (operator took action)
@@ -67,6 +67,15 @@ class MonitoringEngine:
                         "description": verify_description,
                         "kind": "outcome"
                     }]
+                    intervention = db_session.query(Intervention).filter(Intervention.decision_id == d.id).first()
+                    if intervention:
+                        intervention.status = "successful"
+                        intervention.outcome = {"summary": verify_description}
+                        scorecard = db_session.query(VerificationScorecard).filter(VerificationScorecard.intervention_id == intervention.id).first()
+                        if scorecard:
+                            scorecard.status = "successful"
+                            scorecard.score = 1.0
+                            scorecard.summary = verify_description
                     continue
 
                 # --- Campaign pause / spend reduction verification ---
@@ -123,6 +132,15 @@ class MonitoringEngine:
                         "description": verify_description,
                         "kind": "outcome"
                     }]
+                    intervention = db_session.query(Intervention).filter(Intervention.decision_id == d.id).first()
+                    if intervention:
+                        intervention.status = "successful"
+                        intervention.outcome = {"summary": verify_description}
+                        scorecard = db_session.query(VerificationScorecard).filter(VerificationScorecard.intervention_id == intervention.id).first()
+                        if scorecard:
+                            scorecard.status = "successful"
+                            scorecard.score = 1.0
+                            scorecard.summary = verify_description
 
             db_session.flush()
 
@@ -179,4 +197,3 @@ class MonitoringEngine:
 
 def infer_execution(previous: dict[str, Any] | None, latest: dict[str, Any]) -> list[dict[str, Any]]:
     return MonitoringEngine.verify_actions(previous, latest)
-
