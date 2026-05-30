@@ -101,10 +101,9 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
         .order_by(BusinessSnapshot.snapshot_version.desc())
     ).all()
     
-    snapshot_ids = [s.id for s in all_snapshots]
     all_decisions = db.scalars(
         select(Decision)
-        .where(Decision.snapshot_id.in_(snapshot_ids))
+        .where(Decision.snapshot_id == snapshot.id)
         .order_by(Decision.created_at.desc())
     ).all()
     
@@ -165,7 +164,15 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
         })
         
     for d in dec_list:
-        if d["issueType"] == "Campaign-level RTO spike":
+        rule_str = d.get("rule", "") or ""
+        title_str = d.get("title", "") or ""
+        if "placed_roas >= 3.5 AND delivered_roas <= 2.2" in rule_str or "Margin Trap" in title_str:
+            d["signalType"] = "MarginTrap"
+        elif "campaign contains combo" in rule_str or "AOV Dilution" in title_str:
+            d["signalType"] = "AOVDilution"
+        elif "roas < 1.5 AND frequency <= 1.5" in rule_str or "New Launch" in title_str:
+            d["signalType"] = "NewLaunchRisk"
+        elif d["issueType"] == "Campaign-level RTO spike":
             d["signalType"] = "CampaignRTOSpike"
         elif d["issueType"] == "Inventory pressure":
             d["signalType"] = "InventoryRisk"
