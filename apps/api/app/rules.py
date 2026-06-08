@@ -289,7 +289,8 @@ class SignalDetectionEngine:
                 base_conf = thresholds["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                 
-                daily_revenue = sku["daily_velocity"] * average_order_value
+                sku_aov = sku.get("average_order_value") or average_order_value
+                daily_revenue = sku["daily_velocity"] * sku_aov
                 revenue_at_risk = round(daily_revenue * min(projected, 7))
                 
                 severity = "high" if is_cliff else thresholds["severity"]
@@ -319,7 +320,8 @@ class SignalDetectionEngine:
                             f"SKU velocity is {sku['daily_velocity']} units/day",
                             f"Inventory left is {sku['inventory_left']} units",
                             f"Projected stockout is {projected} days",
-                            f"Ad spend grew {spend_growth}% week over week"
+                            f"Ad spend grew {spend_growth}% week over week",
+                            f"SKU-level AOV is Rs {sku_aov:,.2f}"
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": "Inventory cover falls further"},
@@ -373,6 +375,7 @@ class SignalDetectionEngine:
                             f"COD ratio is {campaign['cod_ratio']}% on the flagged audience",
                             f"Placed-order ROAS is {campaign.get('roas_on_placed_orders', 3.0)}x, but realized ROAS is only {campaign.get('roas_on_delivered_orders', 2.0)}x",
                             f"Contribution margin after RTO has compressed to {campaign.get('contribution_margin_after_rto', 10)}%",
+                            f"Placed CAC is Rs {campaign.get('placed_cac', 0.0):,.2f}, Realized CAC is Rs {campaign.get('realized_cac', 0.0):,.2f}",
                             f"Impact formula: {impact_formula} = Rs {realized_margin_loss:,.0f}"
                         ],
                         risk_projection=[
@@ -621,6 +624,7 @@ class SignalDetectionEngine:
                             f"COD ratio is {segment['cod_ratio']}%",
                             f"RTO rate on delivered is {segment['rto_rate_on_delivered']}%",
                             f"ROAS on placed orders is {segment.get('roas_on_placed_orders', 0.0)}x",
+                            f"Placed CAC is Rs {segment.get('placed_cac', 0.0):,.2f}, Realized CAC is Rs {segment.get('realized_cac', 0.0):,.2f}",
                             f"Impact formula: {impact_formula} = Rs {margin_leakage:,.0f}"
                         ],
                         risk_projection=[
@@ -639,14 +643,14 @@ class SignalDetectionEngine:
             opp = SIGNAL_THRESHOLDS["ScalingOpportunity"]
             skus_list = campaign.get("skus", [])
             projected_stockout = 99.0
-            repeat_rate = 0.0
+            repeat_rate = state.get("brand_repeat_rate", 22.0)
             
             for s_name in skus_list:
                 sku_ent = next((s for s in skus if s["name"].lower() == s_name.lower() or s["sku_id"].lower() == s_name.lower()), None)
                 if sku_ent:
                     projected_stockout = min(projected_stockout, sku_ent["projected_stockout_days"])
                 seg_ent = next((sg for sg in segments if sg["name"].lower() == s_name.lower()), None)
-                if seg_ent:
+                if seg_ent and seg_ent.get("repeat_rate") is not None:
                     repeat_rate = max(repeat_rate, seg_ent.get("repeat_rate", 0.0))
             
             roas_deliv = campaign.get("roas_on_delivered_orders", 0.0)
@@ -683,7 +687,8 @@ class SignalDetectionEngine:
                             f"Delivered order ROAS is {roas_deliv}x",
                             f"Repeat purchase rate is {repeat_rate}%",
                             f"Delivered RTO rate is {rto_rate_deliv}%",
-                            f"Inventory stock cover is {projected_stockout} days"
+                            f"Inventory stock cover is {projected_stockout} days",
+                            f"Placed CAC is Rs {campaign.get('placed_cac', 0.0):,.2f}, Realized CAC is Rs {campaign.get('realized_cac', 0.0):,.2f}"
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": "Budget scales smoothly"},

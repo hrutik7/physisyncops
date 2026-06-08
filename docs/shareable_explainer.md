@@ -38,15 +38,18 @@ Here is the exact framework the tool uses:
 2. True RTO Rates (Calculated on Delivered Orders)
    Most standard platforms skew return rates by dividing returned orders by total placed orders. Physisync calculates RTO rate solely on fulfilled/delivered orders (Returned Orders / Delivered Orders), which gives us a completely accurate assessment of our courier/fulfillment performance.
 
-3. Actionable Heuristic Alerts
+3. Placed CAC vs. Realized CAC
+   Standard ads managers report acquisition cost based on placed checkouts. Physisync calculates both Placed CAC (AOV / Placed ROAS) and Realized CAC (AOV / Delivered ROAS) to show the true acquisition cost of cash-collected, delivered customers.
+
+4. Actionable Heuristic Alerts
    The system continuously scans our unified Meta Ads & Shopify logs to flag 5 critical operational risks:
    - Campaign RTO Spike (High return rates on specific ad sets)
-   - Inventory Stockout Risk (High spend acceleration with low stock cover)
+   - Inventory Stockout Risk (High spend acceleration with low stock cover, using SKU-level AOV for precise revenue-at-risk)
    - Creative Fatigue (CTR decays versus exposure frequency)
-   - Margin Leakage (COD-heavy customer segments eroding margins)
-   - Scaling Opportunities (Highly profitable prepaid cohorts safe to scale)
+   - Margin Leakage (COD-heavy customer segments eroding margins, using dynamic unit economics)
+   - Scaling Opportunities (Highly profitable prepaid cohorts with repeat purchase rates >= 25%)
 
-4. Closed-Loop Verification
+5. Closed-Loop Verification
    When our operators pause a campaign, reduce spend, or replenish inventory, the tool doesn't just trust that it was done. It runs differential checks between snapshots to verify that the action was taken and successfully resolved the margin leak.
 
 If your ops or marketing team wants to audit the exact math, equations, and thresholds, I can share our detailed Technical Calculations Guide with them.
@@ -68,11 +71,13 @@ Standard Shopify dashboards show "Placed ROAS" (inflated checkout value). Physis
 Here is the quick logic:
 1. Realized ROAS = Placed ROAS × (1 - RTO Rate). (A 3.0x ROAS with a 30% COD return rate is flagged as a 2.1x Realized ROAS).
 2. RTO Rate = Returned Orders / Delivered Orders (no unfulfilled orders contamination).
-3. The engine alerts us on:
+3. Placed CAC vs. Realized CAC: Shows what you pay for checkouts vs. paid/delivered customers (Realized CAC = SKU AOV / Delivered ROAS).
+4. The engine alerts us on:
    - Campaign RTO Spikes (when campaign RTO > 25% and COD orders > 50)
-   - Inventory Risks (when stock cover is < 7 days and weekly spend growth > 15%)
+   - Inventory Risks (when stock cover is < 7 days and weekly spend growth > 15%, calculated on SKU-level AOV)
    - Creative Fatigue (when CTR decays > 20% and frequency > 4.0)
-   - Scaling Opportunities (when Realized ROAS > 4x and stock cover is > 14 days)
+   - Margin Leakage (COD-heavy customer segments, utilizing brand-specific COGS, shipping, packaging, and PG costs from DB overrides)
+   - Scaling Opportunities (when Realized ROAS > 4x, repeat rates >= 25%, and stock cover is > 14 days)
 
 It also verifies our actions between file uploads (e.g. checks if campaign spend dropped by 80% after we paused it) to ensure we closed the loop.
 
@@ -87,9 +92,11 @@ If a founder asks you: *"How is your calculation different from standard dashboa
 
 | Metric | Shopify / Meta default | Physisync Commerce Engine | Why the Physisync Way is Correct |
 | :--- | :--- | :--- | :--- |
-| **ROAS** | $\frac{\text{Placed Order Value}}{\text{Ad Spend}}$ | $\frac{\text{Delivered Order Value}}{\text{Ad Spend}}$ | Eliminates false scaling of high-RTO campaigns. |
-| **RTO Rate** | $\frac{\text{Returned Orders}}{\text{Total Placed Orders}}$ | $\frac{\text{Returned Orders}}{\text{Delivered Orders}}$ | Prevents cancelled/unfulfilled orders from diluting actual return severity. |
-| **Inventory Cover** | Total warehouse stock | $\frac{\text{Warehouse Stock}}{\text{Daily Velocity}}$ | Factors in current velocity so you don't scale traffic into stockouts. |
+| **ROAS** | Placed Order Value / Ad Spend | Delivered Order Value / Ad Spend | Eliminates false scaling of high-RTO campaigns. |
+| **RTO Rate** | Returned Orders / Total Placed Orders | Returned Orders / Delivered Orders | Prevents cancelled/unfulfilled orders from diluting actual return severity. |
+| **CAC** | Checkout Acquisition Cost | Placed CAC vs. Realized CAC | Realized CAC measures spend against cash-collected customers. |
+| **Repeat Rate** | Blended store-wide retention cohorts | SKU-level + Brand Repeat Rates | Isolates repeat purchase trends of specific heroes. |
+| **Inventory Cover** | Total warehouse stock | Warehouse Stock / Daily Velocity | Factors in current velocity and SKU-level AOV. |
 | **Action Loop** | Manual inspection | Automated differential verification | Verifies if spend reductions/reorders were *actually* completed. |
 
 ---

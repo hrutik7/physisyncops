@@ -55,11 +55,33 @@ Traditional Inventory Management Systems (IMS) and ERPs use static thresholds (e
 
 ---
 
-## 4. Heuristic Rules & Financial Impact Math
+## 4. Metric: Customer Retention & Repeat Purchase Rate
+
+### 4.1 The Formulas
+*   **From Customer Type**: `(Returning Orders / Total Orders) * 100`
+*   **From Customer Cohorts**: `(Unique Customers with > 1 Orders / Total Unique Customers) * 100`
+
+### 4.2 Why Physisync is Mathematically Correct
+Most systems look at lifetime retention or customer cohorts on a store-wide basis. By tracking SKU-specific repeat rates directly from the order streams, Physisync isolates high-LTV hero SKUs from single-purchase acquisition items, giving marketers highly accurate signals on which SKU audiences are safe to scale.
+
+---
+
+## 5. Metric: Customer Acquisition Cost (CAC)
+
+### 5.1 The Formulas
+*   **Placed CAC**: `SKU-level AOV / Placed ROAS`
+*   **Realized CAC**: `SKU-level AOV / Delivered ROAS`
+
+### 5.2 Why Physisync is Mathematically Correct
+Standard platforms only calculate Placed CAC (checkout cost). Physisync provides full visibility of Realized CAC, showing how much hard cash is spent to acquire a successfully delivered, cash-collected customer.
+
+---
+
+## 6. Heuristic Rules & Financial Impact Math
 
 Physisync implements 5 core heuristic rules. Below is the exact logical trigger, the detailed mathematical impact formula, and the justification for why our calculations are correct:
 
-### Rule 4.1: Campaign RTO Spike (High Severity)
+### Rule 6.1: Campaign RTO Spike (High Severity)
 *   **Trigger**:
     `Attributed RTO Rate >= 25%` AND `COD Order Count >= 50`
 
@@ -72,37 +94,32 @@ Daily Margin Loss = Daily Spend * Placed ROAS * (Contribution Margin % / 100) * 
 *   **Daily Spend**: Total campaign ad spend divided by 7 (converting weekly snapshot to daily).
 *   **Placed ROAS**: The ROAS reported on checkout (placed orders) in Meta Ads.
 *   **Delivered ROAS**: Realized ROAS based only on delivered/paid orders.
-*   **Contribution Margin %**: Net profit margin after logistics/returns (calculated as `28 - (RTO Rate * 0.65)` in tasks).
+*   **Contribution Margin %**: Derived dynamically from database unit economics:
+    *   `CM_pre = Gross Margin % - ((Shipping Cost + Packaging Cost + Payment Gateway Cost) / SKU AOV) * 100`
+    *   `RTO Impact Factor = (Shipping Cost + Return Shipping Cost + Packaging Cost) / SKU AOV`
+    *   `Contribution Margin % = CM_pre - (RTO Rate % * RTO Impact Factor)`
+    *(Falls back to static benchmark `28 - (RTO Rate * 0.65)` only if unit economics overrides are missing in DB).*
 *   **max(1 - (Delivered ROAS / Placed ROAS), 0)**: The fraction of ad revenue wiped out by shipping returns.
 *   **Why this calculation is correct**: It isolates the exact cash margin lost on returns daily. Rather than looking at a store-wide RTO, it identifies the specific ad sets bleeding capital and quantifies the exact opportunity cost of not pausing them immediately.
-*   **Example**:
-    *   *Campaign*: "Prospecting_Tier2" (Weekly Spend = Rs. 70,000 -> Daily Spend = Rs. 10,000)
-    *   *Metrics*: Placed ROAS = 3.0x, Delivered ROAS = 2.0x, Contribution Margin = 10%
-    *   *Daily Margin Loss*: `Rs. 10,000 * 3.0 * (10 / 100) * (1 - (2.0 / 3.0)) = Rs. 1,000 / day`
 
 ---
 
-### Rule 4.2: Inventory Risk (High Severity)
+### Rule 6.2: Inventory Risk (High Severity)
 *   **Trigger**:
     `Projected Stockout Days <= 7 days` AND `Spend Growth >= 15%`
 
 #### 📊 Business Impact Formula (Revenue at Risk):
 ```
-Revenue at Risk = Daily Sales Velocity * AOV * min(Projected Stockout Days, 7)
+Revenue at Risk = Daily Sales Velocity * SKU AOV * min(Projected Stockout Days, 7)
 ```
 *   **Daily Sales Velocity**: Units sold per day for this specific SKU (from the `inventory` or `shopify_orders` sheet).
-*   **AOV (Average Order Value)**: Blended store-wide average order value dynamically calculated as `Total Sales / Total Placed Orders`.
+*   **SKU AOV (Average Order Value)**: SKU-specific average order value dynamically calculated from the orders sheet. Fallback to store-wide AOV only if SKU-specific data is missing.
 *   **min(Projected Stockout Days, 7)**: Capped at a maximum of 7 days (1 week) to represent immediate near-term operational risk.
-*   **Why this calculation is correct**: It calculates the cash volume that *will* be lost over the next week if stockouts occur. This lets the founder immediately weigh the cost of air-shipping inventory against the cost of slowing down ad spend.
-*   **Example**:
-    *   *SKU*: "Legend Sneaker" (Inventory Left = 30 units, Daily Sales Velocity = 10 units/day)
-    *   *AOV*: Rs. 1,500
-    *   *Spend Growth*: 18% (Alert Triggered! Stockout days = 30 / 10 = 3 days, which is <= 7 days)
-    *   *Revenue at Risk*: `10 units/day * Rs. 1,500 * 3 days = Rs. 45,000`
+*   **Why this calculation is correct**: By using SKU-specific AOV instead of a store-wide blended AOV, it prevents underestimating the revenue-at-risk for premium product lines while maintaining accuracy for low-cost lines.
 
 ---
 
-### Rule 4.3: Creative Fatigue (Medium Severity)
+### Rule 6.3: Creative Fatigue (Medium Severity)
 *   **Trigger**:
     `Creative Frequency >= 4.0` AND `CTR Drop >= 20%`
 
@@ -114,34 +131,28 @@ Spend Efficiency at Risk = Weekly Campaign Spend * (CTR Drop % / 100)
 *   **Weekly Campaign Spend**: Total campaign ad spend in the last 7 days.
 *   **CTR Drop %**: The percentage drop in Click-Through Rate compared to the previous week.
 *   **Why this calculation is correct**: A 20% drop in CTR means you are acquiring 20% fewer website visitors for the exact same ad spend. Thus, 20% of your ad spend is completely wasted on an exhausted audience.
-*   **Example**:
-    *   *Campaign*: "UGC_Reels_Scale" (Weekly Spend = Rs. 50,000)
-    *   *CTR metrics*: Previous Week CTR = 2.5%, Current Week CTR = 1.9% (Drop = 24%)
-    *   *Spend Efficiency at Risk*: `Rs. 50,000 * (24 / 100) = Rs. 12,000`
 
 ---
 
-### Rule 4.4: Margin Leakage (High Severity)
+### Rule 6.4: Margin Leakage (High Severity)
 *   **Trigger**:
     `COD Ratio >= 60%` AND `Delivered RTO Rate >= 18%` AND `Placed ROAS >= 3.0`
 
 #### 📊 Business Impact Formula (Margin Leakage):
 ```
-Margin Leakage = Blended Campaign Spend * (RTO Rate % / 100) * 0.40
+Margin Leakage = Blended Campaign Spend * (RTO Rate % / 100) * Waste Multiplier
 ```
 *(Enforced floor: Rs. 2,000)*
 *   **Blended Campaign Spend**: The total ad spend across all ad sets targeting this customer segment/SKU.
 *   **RTO Rate %**: The return rate on delivered orders for this segment.
-*   **0.40 (Operational Waste constant)**: Industry benchmark representing the cost of RTO. Every returned order wastes approximately 40% of the customer acquisition and operational spend in two-way courier shipping fees, packaging damage, warehouse restocking labor, and shelf-life decay.
-*   **Why this calculation is correct**: Standard platforms celebrate a campaign with >3.0 Placed ROAS. Physisync knows that if COD preference is extremely high and RTO is elevated, 40% of the shipping/operational capital is completely burned on returned logistics. We expose this margin leakage so you can shift budget to prepaid retargeting.
-*   **Example**:
-    *   *Segment*: "Tier 2 COD Buyers" (Blended Campaign Spend = Rs. 1,00,000)
-    *   *Metrics*: COD Ratio = 70%, Delivered RTO Rate = 25% (Alert Triggered!)
-    *   *Margin Leakage*: `Rs. 1,00,000 * (25 / 100) * 0.40 = Rs. 10,000`
+*   **Waste Multiplier**: Derived dynamically from database unit economics:
+    *   `Waste Multiplier = (Shipping Cost + Return Shipping Cost + Packaging Cost) / SKU AOV`
+    *(Falls back to static benchmark constant `0.40` only if overrides are missing in DB).*
+*   **Why this calculation is correct**: Standard platforms celebrate a campaign with >3.0 Placed ROAS. Physisync knows that if COD preference is extremely high and RTO is elevated, a significant portion of the shipping/operational capital is completely burned on returned logistics. We expose this margin leakage so you can shift budget to prepaid retargeting.
 
 ---
 
-### Rule 4.5: Scaling Opportunity (Low Severity)
+### Rule 6.5: Scaling Opportunity (Low Severity)
 *   **Trigger**:
     `Delivered ROAS >= 4.0` AND `Delivered RTO Rate <= 7%` AND `Repeat Rate >= 25%` AND `Contribution Margin >= 30%` AND `Projected Stockout Days >= 14`
 
@@ -154,14 +165,10 @@ Incremental Revenue Opportunity = Weekly Campaign Spend * 0.25 * Delivered ROAS
 *   **0.25 (25% Scaling standard)**: The standard conservative budget increase recommended by media buyers to scale campaigns without disrupting the ad delivery algorithm.
 *   **Delivered ROAS**: Realized ROAS (actual cash collected).
 *   **Why this calculation is correct**: D2C brands are often too conservative when scaling. Physisync checks five distinct pillars (Profitability, Return mix, Retention, Margin, and Stock cover) to mathematically guarantee that a 25% budget increase will yield proportional, highly profitable revenue without stocking out.
-*   **Example**:
-    *   *Campaign*: "Prepaid_Retargeting_LTV" (Weekly Spend = Rs. 40,000)
-    *   *Metrics*: Delivered ROAS = 5.0x, RTO Rate = 4% (Alert Triggered!)
-    *   *Incremental Revenue Opportunity*: `Rs. 40,000 * 0.25 * 5.0 = Rs. 50,000`
 
 ---
 
-## 5. Verification: Closed-Loop Accountability
+## 7. Verification: Closed-Loop Accountability
 
 When you take action, standard platforms require you to manually check spreadsheets days later to see if it worked. Physisync automates this:
 *   **Paused Campaign Verification**: Confirms that flagged campaign spend dropped by **>= 80%**.

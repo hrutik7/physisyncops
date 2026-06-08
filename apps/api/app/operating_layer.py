@@ -45,11 +45,12 @@ def upsert_unit_economics_from_state(db: Session, brand_id: str, state: dict[str
             .first()
         )
         margin = float(sku.get("contribution_margin_after_rto", 35))
+        sku_aov = sku.get("average_order_value") or aov
         if econ is None:
             econ = UnitEconomics(brand_id=brand_id, sku_id=sku_id)
             db.add(econ)
         econ.gross_margin_percent = margin
-        econ.average_order_value = float(aov) if aov else econ.average_order_value
+        econ.average_order_value = float(sku_aov) if sku_aov else econ.average_order_value
         econ.updated_at = datetime.utcnow()
 
 

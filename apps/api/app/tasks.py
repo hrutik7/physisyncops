@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from .celery_app import celery_app
 from .db import SessionLocal
-from .models import BusinessSnapshot, Decision, Brand
+from .models import BusinessSnapshot, Decision, Brand, UnitEconomics
 from .rules import SignalDetectionEngine, DataFreshnessValidator
 from .verification import MonitoringEngine
 from .demo_data import DEMO_STATE
@@ -27,6 +27,44 @@ def display_name_from_brand_id(brand_id: str) -> str:
     return clean.title() if clean else "Uploaded Brand"
 
 
+def calculate_sku_margin_params(db, brand_id: str, sku_name_or_id: str, sku_aov: float):
+    # Load Unit Economics from DB
+    econ_records = db.query(UnitEconomics).filter(UnitEconomics.brand_id == brand_id).all()
+    econ_by_sku = {e.sku_id.lower(): e for e in econ_records if e.sku_id}
+    brand_econ = next((e for e in econ_records if not e.sku_id), None)
+
+    def get_sku_economics(sku_name_or_id: str):
+        if not sku_name_or_id:
+            return brand_econ
+        key = sku_name_or_id.lower()
+        econ = econ_by_sku.get(key)
+        if not econ:
+            clean_key = re.sub(r"^sku-", "", key)
+            econ = econ_by_sku.get(clean_key)
+        if not econ:
+            econ = econ_by_sku.get(f"sku-{clean_key}" if "clean_key" in locals() else f"sku-{key}")
+        if not econ:
+            econ = brand_econ
+        return econ
+
+    econ = get_sku_economics(sku_name_or_id)
+    sku_aov = max(sku_aov or 500.0, 1.0)
+    if econ and (econ.shipping_cost > 0 or econ.rto_cost > 0 or econ.packaging_cost > 0):
+        shipping = econ.shipping_cost
+        pkg = econ.packaging_cost
+        gw = econ.payment_gateway_cost
+        rto_shipping = econ.rto_cost
+        gm = econ.gross_margin_percent
+        
+        cm_pre = gm - ((shipping + pkg + gw) / sku_aov) * 100
+        impact_factor = (shipping + rto_shipping + pkg) / sku_aov
+        waste_mult = (shipping + rto_shipping + pkg) / sku_aov
+        
+        return round(cm_pre, 2), round(impact_factor, 3), round(waste_mult, 3)
+    else:
+        return 28.0, 0.65, 0.40
+
+
 @celery_app.task(name="app.tasks.process_excel_upload_task", bind=True)
 def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: dict[str, str], file_path: str) -> dict:
     self.update_state(state="PROGRESS", meta={"step": "Parsing Excel workbook sheets"})
@@ -35,6 +73,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
     try:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Uploaded file not found at {file_path}")
+            
+        def calculate_sku_margin_params_local(sku_name_or_id: str, sku_aov: float):
+            return calculate_sku_margin_params(db, brand_id, sku_name_or_id, sku_aov)
             
         # Load sheets
         xls = pd.ExcelFile(file_path)
@@ -285,11 +326,37 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 rto_col = next((c for c in orders_df.columns if "rto" in c or "returned" in c or "undelivered" in c), None)
                 delivered_col = next((c for c in orders_df.columns if "delivered" in c or "fulfilled" in c), None)
                 revenue_col = next((c for c in orders_df.columns if "revenue" in c or "total" in c or "amount" in c or "price" in c), None)
+                cust_type_col = next((c for c in orders_df.columns if "customer_type" in c or "user_type" in c or "type" in c), None)
+                cust_id_col = next((c for c in orders_df.columns if "customer" in c or "email" in c or "phone" in c or "user" in c), None)
+
+                blended_aov = 1500.0
                 if revenue_col and len(orders_df) > 0:
                     revenue_values = pd.to_numeric(orders_df[revenue_col], errors="coerce").dropna()
                     if len(revenue_values) > 0:
                         new_state["average_order_value"] = round(float(revenue_values.sum()) / len(orders_df), 2)
-                
+                        blended_aov = new_state["average_order_value"]
+
+                # Calculate overall brand-level RTO fallback
+                if delivered_col and rto_col:
+                    total_delivered = int(orders_df[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum())
+                    total_rto = int(orders_df[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum())
+                    if total_delivered > 0:
+                        new_state["brand_rto_rate"] = round((total_rto / total_delivered) * 100, 2)
+                        print(f"   📈 Brand-level Blended RTO rate calculated: {new_state['brand_rto_rate']}%", flush=True)
+
+                # Calculate overall brand-level repeat purchase rate
+                brand_repeat_rate = 22.0
+                if cust_type_col:
+                    returning_orders = int(orders_df[cust_type_col].astype(str).str.lower().str.contains("returning|repeat").sum())
+                    brand_repeat_rate = round((returning_orders / max(len(orders_df), 1)) * 100, 2)
+                elif cust_id_col:
+                    customer_order_counts = orders_df[cust_id_col].value_counts()
+                    repeat_customers = int((customer_order_counts > 1).sum())
+                    total_customers = int(customer_order_counts.nunique())
+                    brand_repeat_rate = round((repeat_customers / max(total_customers, 1)) * 100, 2)
+                new_state["brand_repeat_rate"] = brand_repeat_rate
+                print(f"   📈 Brand-level Repeat Purchase Rate calculated: {brand_repeat_rate}%", flush=True)
+
                 if sku_col:
                     grouped = orders_df.groupby(sku_col)
                     for sku_name, group in grouped:
@@ -297,16 +364,38 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         if not sku_name_str or sku_name_str.lower() == "nan":
                             continue
                             
+                        # Calculate SKU-specific AOV
+                        sku_aov = blended_aov
+                        if revenue_col:
+                            sku_rev = pd.to_numeric(group[revenue_col], errors="coerce").sum()
+                            sku_orders_count = len(group)
+                            sku_aov = round(float(sku_rev) / max(sku_orders_count, 1), 2) if sku_orders_count > 0 else blended_aov
+                        
+                        sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == sku_name_str.lower() or s["sku_id"].lower() == sku_name_str.lower()), None)
+                        if sku_entity:
+                            sku_entity["average_order_value"] = sku_aov
+
+                        # Calculate SKU-specific repeat rate
+                        sku_repeat_rate = brand_repeat_rate
+                        if cust_type_col:
+                            ret_orders = int(group[cust_type_col].astype(str).str.lower().str.contains("returning|repeat").sum())
+                            sku_repeat_rate = round((ret_orders / max(len(group), 1)) * 100, 2)
+                        elif cust_id_col:
+                            cust_counts = group[cust_id_col].value_counts()
+                            rep_custs = int((cust_counts > 1).sum())
+                            tot_custs = int(cust_counts.nunique())
+                            sku_repeat_rate = round((rep_custs / max(tot_custs, 1)) * 100, 2)
+
                         segment = next((s for s in new_state["customer_segments"] if s["name"].lower() == sku_name_str.lower()), None)
-                        if segment and pm_col:
-                            cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum())
-                            placed_count = len(group)
-                            segment["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
-                            segment["prepaid_ratio"] = 100 - segment["cod_ratio"]
-                        if segment and revenue_col:
-                            segment_revenue = pd.to_numeric(group[revenue_col], errors="coerce").sum()
-                            segment["average_order_value"] = round(float(segment_revenue) / max(len(group), 1), 2)
-                            
+                        if segment:
+                            segment["average_order_value"] = sku_aov
+                            segment["repeat_rate"] = sku_repeat_rate
+                            if pm_col:
+                                cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum())
+                                placed_count = len(group)
+                                segment["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
+                                segment["prepaid_ratio"] = 100 - segment["cod_ratio"]
+
                         for campaign in new_state.get("campaigns", []):
                             if sku_name_str.lower() in campaign["campaign_name"].lower() or campaign["campaign_name"].lower() in sku_name_str.lower():
                                 placed_count = len(group)
@@ -330,12 +419,30 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 else:
                     sku["projected_stockout_days"] = 99.0
                     
+            blended_aov = new_state.get("average_order_value") or 1500.0
             for campaign in new_state.get("campaigns", []):
-                rto_pct = campaign.get("rto_rate_attributed", 0)
-                if rto_pct > 0:
-                    campaign["roas_on_delivered_orders"] = round(campaign["roas_on_placed_orders"] * (1 - (rto_pct / 100)), 2)
-                    campaign["contribution_margin_after_rto"] = max(int(28 - (rto_pct * 0.65)), 5)
-                    print(f"   📈 Blended Adjustment for '{campaign['campaign_name']}': ROAS On Placed orders {campaign['roas_on_placed_orders']}x compressed to ROAS On Delivered orders {campaign['roas_on_delivered_orders']}x. Margin compressed to {campaign['contribution_margin_after_rto']}%", flush=True)
+                rto_pct = campaign.get("rto_rate_attributed", 0.0)
+                if rto_pct == 0.0:
+                    rto_pct = new_state.get("brand_rto_rate", 31.0)
+                    campaign["rto_rate_attributed"] = rto_pct
+                
+                campaign_skus = campaign.get("skus", [])
+                primary_sku = campaign_skus[0] if campaign_skus else ""
+                
+                sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == primary_sku.lower()), None)
+                sku_aov = sku_entity.get("average_order_value") if sku_entity else blended_aov
+                if not sku_aov:
+                    sku_aov = blended_aov
+                
+                cm_pre, rto_impact_factor, waste_mult = calculate_sku_margin_params_local(primary_sku or campaign.get("campaign_name", ""), sku_aov)
+                
+                campaign["roas_on_delivered_orders"] = round(campaign["roas_on_placed_orders"] * (1 - (rto_pct / 100)), 2)
+                campaign["contribution_margin_after_rto"] = max(int(cm_pre - (rto_pct * rto_impact_factor)), 5)
+                campaign["operational_waste_multiplier"] = waste_mult
+                campaign["placed_cac"] = round(sku_aov / max(campaign["roas_on_placed_orders"], 0.1), 2)
+                campaign["realized_cac"] = round(sku_aov / max(campaign["roas_on_delivered_orders"], 0.1), 2)
+                
+                print(f"   📈 Dynamic CM for '{campaign['campaign_name']}': ROAS On Placed orders {campaign['roas_on_placed_orders']}x compressed to ROAS On Delivered orders {campaign['roas_on_delivered_orders']}x. Margin compressed to {campaign['contribution_margin_after_rto']}% (using CM_pre={cm_pre}%, RTO_factor={rto_impact_factor}). Placed CAC = Rs {campaign['placed_cac']}, Realized CAC = Rs {campaign['realized_cac']}", flush=True)
                     
         else:
             # --- Backward compatible Single Sheet Ingestion ---
@@ -351,10 +458,39 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             
             if upload_source == "shopify_orders":
                 revenue_col = next((c for c in df_canonical.columns if c in {"revenue", "total", "amount", "price", "order_value"}), None)
+                blended_aov = 1500.0
                 if revenue_col and len(df_canonical) > 0:
                     revenue_values = pd.to_numeric(df_canonical[revenue_col], errors="coerce").dropna()
                     if len(revenue_values) > 0:
                         new_state["average_order_value"] = round(float(revenue_values.sum()) / len(df_canonical), 2)
+                        blended_aov = new_state["average_order_value"]
+
+                # Calculate overall brand RTO rate for single sheet
+                blended_cod_ratio = 40.0
+                if "cod_orders" in df_canonical.columns:
+                    cod_col = df_canonical["cod_orders"]
+                    cod_count = int(cod_col.astype(str).str.upper().str.contains("COD|CASH").sum())
+                    blended_cod_ratio = round((cod_count / max(len(df_canonical), 1)) * 100, 2)
+                new_state["brand_rto_rate"] = round(blended_cod_ratio * 0.38, 2)
+
+                # Calculate repeat rate from customer type or customer id
+                cust_type_col = next((c for c in df_canonical.columns if "customer_type" in c or "user_type" in c or "type" in c), None) or next((c for c in df.columns if "customer_type" in c or "user_type" in c or "type" in c), None)
+                cust_id_col = next((c for c in df_canonical.columns if "customer" in c or "email" in c or "phone" in c or "user" in c), None) or next((c for c in df.columns if "customer" in c or "email" in c or "phone" in c or "user" in c), None)
+                
+                brand_repeat_rate = 22.0
+                df_to_use = df_canonical if (cust_type_col in df_canonical.columns or cust_id_col in df_canonical.columns) else df
+                col_type = cust_type_col if cust_type_col in df_to_use.columns else None
+                col_id = cust_id_col if cust_id_col in df_to_use.columns else None
+
+                if col_type:
+                    returning_orders = int(df_to_use[col_type].astype(str).str.lower().str.contains("returning|repeat").sum())
+                    brand_repeat_rate = round((returning_orders / max(len(df_to_use), 1)) * 100, 2)
+                elif col_id:
+                    customer_order_counts = df_to_use[col_id].value_counts()
+                    repeat_customers = int((customer_order_counts > 1).sum())
+                    total_customers = int(customer_order_counts.nunique())
+                    brand_repeat_rate = round((repeat_customers / max(total_customers, 1)) * 100, 2)
+                new_state["brand_repeat_rate"] = brand_repeat_rate
 
                 # Create segments and SKUs dynamically from the uploaded orders sheet
                 if "sku_id" in df_canonical.columns:
@@ -385,6 +521,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         prepaid_ratio = round(100 - cod_ratio, 2)
                         rto_rate_on_delivered = round(cod_ratio * 0.38, 2)
                         
+                        # Calculate SKU-specific AOV
+                        sku_aov = blended_aov
+                        if revenue_col:
+                            sku_rev = pd.to_numeric(group[revenue_col], errors="coerce").sum()
+                            sku_aov = round(float(sku_rev) / max(order_count, 1), 2)
+
                         # Find or create SKU
                         sku = next((s for s in new_state.get("skus", []) if s["sku_id"].lower() == sku_name_str.lower() or s["name"].lower() == sku_name_str.lower()), None)
                         if not sku:
@@ -396,15 +538,29 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "reorder_threshold": 40,
                                 "projected_stockout_days": round(80 / max(velocity, 0.1), 1),
                                 "contribution_margin_after_rto": 25,
+                                "average_order_value": sku_aov,
                                 "spend_growth_percent": 18.0,  # Force elevated spend growth to trigger stockout risk dynamically
                                 "campaigns": []
                             }
                             new_state["skus"].append(sku)
                         else:
                             sku["daily_velocity"] = velocity
+                            sku["average_order_value"] = sku_aov
                             if sku["daily_velocity"] > 0:
                                 sku["projected_stockout_days"] = round(sku["inventory_left"] / sku["daily_velocity"], 1)
                         
+                        # Calculate SKU-specific repeat rate
+                        sku_repeat_rate = brand_repeat_rate
+                        group_orig = df_to_use.loc[group.index]
+                        if col_type:
+                            ret_orders = int(group_orig[col_type].astype(str).str.lower().str.contains("returning|repeat").sum())
+                            sku_repeat_rate = round((ret_orders / max(len(group_orig), 1)) * 100, 2)
+                        elif col_id:
+                            cust_counts = group_orig[col_id].value_counts()
+                            rep_custs = int((cust_counts > 1).sum())
+                            tot_custs = int(cust_counts.nunique())
+                            sku_repeat_rate = round((rep_custs / max(tot_custs, 1)) * 100, 2)
+
                         # Find or create customer segment
                         segment = next((s for s in new_state.get("customer_segments", []) if s["name"].lower() == sku_name_str.lower()), None)
                         if not segment:
@@ -413,9 +569,10 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "name": sku_name_str,
                                 "prepaid_ratio": prepaid_ratio,
                                 "cod_ratio": cod_ratio,
-                                "repeat_rate": 22.0,
+                                "repeat_rate": sku_repeat_rate,
                                 "return_rate": round(cod_ratio * 0.15, 2),
                                 "rto_rate_on_delivered": rto_rate_on_delivered,
+                                "average_order_value": sku_aov,
                                 "skus": [sku_name_str]
                             }
                             new_state["customer_segments"].append(segment)
@@ -423,6 +580,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             segment["cod_ratio"] = cod_ratio
                             segment["prepaid_ratio"] = prepaid_ratio
                             segment["rto_rate_on_delivered"] = rto_rate_on_delivered
+                            segment["repeat_rate"] = sku_repeat_rate
+                            segment["average_order_value"] = sku_aov
 
                 # Create campaigns dynamically as well
                 if "campaign_id" in df_canonical.columns:
@@ -476,7 +635,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "cod_ratio": cod_ratio,
                                 "rto_count_attributed": 0,
                                 "delivered_orders_attributed": placed_count,
-                                "rto_rate_attributed": 0.0,
+                                "rto_rate_attributed": rto_pct,
                                 "contribution_margin_after_rto": 25,
                                 "skus": [sku_name_str] if sku_name_str else []
                             }
@@ -486,6 +645,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             campaign["roas_on_placed_orders"] = roas
                             campaign["cod_order_count"] = cod_count
                             campaign["cod_ratio"] = cod_ratio
+                            campaign["rto_rate_attributed"] = rto_pct
                             
             elif upload_source == "meta_ads":
                 if "campaign_id" in df_canonical.columns:
@@ -566,6 +726,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             brand.name = new_state.get("brand_name") or brand.name
 
         # Dynamically calculate blended ROAS for all customer segments based on matched campaigns
+        blended_aov = new_state.get("average_order_value") or 1500.0
         for segment in new_state.get("customer_segments", []):
             segment_skus = segment.get("skus", [])
             seg_name = segment.get("name", "")
@@ -592,6 +753,21 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             else:
                 segment["roas_on_placed_orders"] = 0.0
                 segment["roas_on_delivered_orders"] = 0.0
+
+            # Calculate Segment level AOV
+            seg_aov = segment.get("average_order_value") or blended_aov
+            segment["average_order_value"] = seg_aov
+
+            # Calculate Placed and Realized CAC for segment
+            placed_roas = segment.get("roas_on_placed_orders", 3.0)
+            delivered_roas = segment.get("roas_on_delivered_orders", 2.0)
+            segment["placed_cac"] = round(seg_aov / max(placed_roas, 0.1), 2)
+            segment["realized_cac"] = round(seg_aov / max(delivered_roas, 0.1), 2)
+
+            # Get SKU-level economics for the segment
+            primary_sku = segment_skus[0] if segment_skus else seg_name
+            cm_pre, rto_impact_factor, waste_mult = calculate_sku_margin_params_local(primary_sku, seg_aov)
+            segment["operational_waste_multiplier"] = waste_mult
 
         # Dynamically calculate blended spend growth for all SKUs based on matched campaigns
         for sku in new_state.get("skus", []):
