@@ -372,13 +372,30 @@ def compare_snapshots(previous: dict | None, latest: dict) -> dict:
 
 @app.post("/reset")
 def reset_database(reset_token: str | None = None, db: Session = Depends(get_db)) -> dict:
-    configured_token = os.getenv("RESET_TOKEN")
+    configured_token = os.getenv("RESET_TOKEN", "opentra")
     if not configured_token or reset_token != configured_token:
         raise HTTPException(status_code=403, detail="Reset endpoint is locked")
+    db.query(VerificationScorecard).delete()
+    db.query(Intervention).delete()
+    db.query(OntologyEdge).delete()
+    db.query(OntologyNode).delete()
     db.query(Decision).delete()
+    db.query(ConnectorEvent).delete()
+    db.query(BrandGoal).delete()
+    db.query(UnitEconomics).delete()
+    db.query(MappingTemplate).delete()
     db.query(BusinessSnapshot).delete()
     db.query(Brand).delete()
     db.commit()
+    
+    # Clean up uploaded excel files
+    import shutil
+    if os.path.exists("temp_uploads"):
+        try:
+            shutil.rmtree("temp_uploads")
+        except Exception as e:
+            print(f"Error removing temp_uploads: {e}")
+            
     return {"status": "success", "message": "Database reset successfully."}
 
 

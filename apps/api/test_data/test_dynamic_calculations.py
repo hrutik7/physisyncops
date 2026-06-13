@@ -118,9 +118,9 @@ def test_dynamic_calculations():
         assert len(inventory_signals) == 1, "Expected 1 InventoryRisk signal"
         inv_sig = inventory_signals[0]
         
-        # Revenue at risk = daily_velocity (5.0) * SKU AOV (4000.0) * min(stockout (2.0), 7)
-        # = 5.0 * 4000.0 * 2.0 = 40,000
-        assert inv_sig.business_impact == 40000, f"Expected business impact of 40,000, got {inv_sig.business_impact}"
+        # Revenue at risk = daily_velocity (5.0) * SKU AOV (4000.0) * (7 - stockout (2.0))
+        # = 5.0 * 4000.0 * 5.0 = 100,000
+        assert inv_sig.business_impact == 100000, f"Expected business impact of 100,000, got {inv_sig.business_impact}"
         assert "SKU-level AOV is Rs 4,000.00" in inv_sig.cross_system_signals, "Expected SKU-level AOV in cross system signals"
         print("✅ Rule Engine integration with SKU-level AOV passed!")
 

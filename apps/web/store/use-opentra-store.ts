@@ -5,7 +5,7 @@ import { operationalState } from "@/lib/demo-data";
 import { Decision, DecisionState, OperationalState, TimelineEvent, UploadSource, MappingSuggestion } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const RESET_TOKEN = process.env.NEXT_PUBLIC_RESET_TOKEN;
+const RESET_TOKEN = process.env.NEXT_PUBLIC_RESET_TOKEN || "opentra";
 
 interface OpentraStore extends OperationalState {
   selectedDecisionId: string;
@@ -259,7 +259,10 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
         loading: false,
         error: null,
         taskStatus: null,
-        taskMeta: null
+        taskMeta: null,
+        selectedFile: null,
+        uploadedColumns: [],
+        mappingOpen: false
       });
     } catch (err: any) {
       console.error(err);

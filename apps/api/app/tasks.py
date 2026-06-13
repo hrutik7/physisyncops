@@ -149,6 +149,54 @@ def workbook_has_rto_status_sheet(xls: pd.ExcelFile, sheet_names: list[str]) -> 
     return False, None
 
 
+def calculate_df_rto_rate(df: pd.DataFrame, fallback_cod_ratio: float = 50.0) -> tuple[float, bool]:
+    """
+    Calculates the RTO rate from a DataFrame containing Shopify order data.
+    Uses the formula: RTO / (Total - Cancelled).
+    Falls back to COD-based heuristic if status/RTO columns are not present.
+    Returns (rto_rate, rto_data_present)
+    """
+    if df is None or len(df) == 0:
+        return 0.0, False
+
+    df_cols = [str(c).strip().lower() for c in df.columns]
+    status_col = find_col(df_cols, "status", "delivery status", "fulfillment status")
+    rto_col = find_col(df_cols, "rto", "returned", "undelivered") or status_col
+    delivered_col = find_col(df_cols, "delivered", "fulfilled") or status_col
+
+    col_mapping = {str(c).strip().lower(): c for c in df.columns}
+    
+    orig_status_col = col_mapping.get(status_col) if status_col else None
+    orig_rto_col = col_mapping.get(rto_col) if rto_col else None
+    orig_delivered_col = col_mapping.get(delivered_col) if delivered_col else None
+
+    if orig_rto_col and orig_delivered_col:
+        if orig_rto_col == orig_delivered_col:
+            status_series = df[orig_rto_col].astype(str).str.upper().str.strip()
+            total_rto = int(status_series.isin(["RTO", "RETURNED", "UNDELIVERED"]).sum())
+            total_cancelled = int(status_series.str.contains("CANCEL").sum())
+            denominator = len(df) - total_cancelled
+            if denominator > 0:
+                return round((total_rto / denominator) * 100, 2), True
+        else:
+            rto_mask = df[orig_rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"])
+            delivered_mask = df[orig_delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"])
+            total_rto = int(rto_mask.sum())
+            total_delivered = int(delivered_mask.sum())
+            if total_rto + total_delivered > 0:
+                return round((total_rto / (total_rto + total_delivered)) * 100, 2), True
+
+    pm_col = find_col(df_cols, "payment type", "payment method", "payment mode", "method", "cod_orders")
+    orig_pm_col = col_mapping.get(pm_col) if pm_col else None
+    if orig_pm_col:
+        cod_count = int(df[orig_pm_col].astype(str).str.upper().str.contains("COD|CASH").sum())
+        cod_ratio = (cod_count / len(df)) * 100
+        return round(cod_ratio * 0.38, 2), False
+
+    return round(fallback_cod_ratio * 0.38, 2), False
+
+
+
 @celery_app.task(name="app.tasks.process_excel_upload_task", bind=True)
 def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: dict[str, str], file_path: str) -> dict:
     self.update_state(state="PROGRESS", meta={"step": "Parsing Excel workbook sheets"})
@@ -373,7 +421,16 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             if prev_spend > 0:
                                 campaign["spend_growth_percent"] = round(((campaign["spend"] - prev_spend) / prev_spend) * 100, 2)
                         if roas_col:
-                            campaign["roas_on_placed_orders"] = safe_series_mean(group[roas_col], campaign.get("roas_on_placed_orders", 3.0))
+                            roas_vals = pd.to_numeric(group[roas_col], errors="coerce").fillna(0.0)
+                            if spend_col:
+                                spend_vals = pd.to_numeric(group[spend_col], errors="coerce").fillna(0.0)
+                                total_grp_spend = spend_vals.sum()
+                                if total_grp_spend > 0:
+                                    campaign["roas_on_placed_orders"] = round(float((spend_vals * roas_vals).sum() / total_grp_spend), 2)
+                                else:
+                                    campaign["roas_on_placed_orders"] = round(float(roas_vals.mean()), 2)
+                            else:
+                                campaign["roas_on_placed_orders"] = round(float(roas_vals.mean()), 2)
                             campaign["roas_source"] = "Meta Ads Manager ('meta_ads' sheet)"
                         else:
                             campaign["roas_source"] = "default baseline"
@@ -476,16 +533,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         new_state["average_order_value"] = round(float(revenue_values.sum()) / len(orders_df), 2)
                         blended_aov = new_state["average_order_value"]
 
-                # Calculate overall brand-level RTO fallback
-                if delivered_col and rto_col:
-                    delivered_mask = orders_df[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"])
-                    rto_mask = orders_df[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"])
-                    total_delivered = int(delivered_mask.sum())
-                    total_rto = int(rto_mask.sum())
-                    total_resolved = total_delivered + total_rto
-                    if total_resolved > 0:
-                        new_state["brand_rto_rate"] = round((total_rto / total_resolved) * 100, 2)
-                        print(f"   📈 Brand-level Blended RTO rate calculated: {new_state['brand_rto_rate']}%", flush=True)
+                # Calculate overall brand-level RTO
+                brand_rto, rto_present = calculate_df_rto_rate(orders_df)
+                new_state["brand_rto_rate"] = brand_rto
+                if rto_present:
+                    rto_data_present = True
+                print(f"   📈 Brand-level Blended RTO rate calculated: {new_state['brand_rto_rate']}%", flush=True)
 
                 # Calculate overall brand-level repeat purchase rate
                 brand_repeat_rate = 22.0
@@ -648,15 +701,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             cod_ratio = round((cod_count / max(placed_count, 1)) * 100, 2)
                             prepaid_ratio = 100 - cod_ratio
 
-                        # Calculate RTO rate from order status/delivery status
-                        rto_rate_on_delivered = round(cod_ratio * 0.38, 2)
-                        if delivered_col and rto_col:
-                            delivered_mask = group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"])
-                            rto_mask = group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"])
-                            total_del = int(delivered_mask.sum())
-                            total_r = int(rto_mask.sum())
-                            if total_del + total_r > 0:
-                                rto_rate_on_delivered = round((total_r / (total_del + total_r)) * 100, 2)
+                        # Calculate RTO rate using data-driven helper
+                        rto_rate_on_delivered, _ = calculate_df_rto_rate(group, fallback_cod_ratio=cod_ratio)
 
                         product_name = sku_name_str
                         if product_col and product_col in group.columns:
@@ -692,14 +738,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum()) if pm_col else 0
                                 campaign["cod_order_count"] = cod_count
                                 campaign["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
-                                delivered_count = int(group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum()) if delivered_col else placed_count
-                                rto_count = int(group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum()) if rto_col else 0
+                                # Use data-driven helper for campaign RTO rate
+                                rto_rate_attr, _ = calculate_df_rto_rate(group, fallback_cod_ratio=campaign["cod_ratio"])
+                                campaign["rto_rate_attributed"] = rto_rate_attr
                                 campaign["placed_orders_attributed"] = placed_count
-                                campaign["delivered_orders_attributed"] = delivered_count
-                                campaign["rto_count_attributed"] = rto_count
-                                resolved_orders = campaign["delivered_orders_attributed"] + campaign["rto_count_attributed"]
-                                if resolved_orders > 0:
-                                    campaign["rto_rate_attributed"] = round((campaign["rto_count_attributed"] / resolved_orders) * 100, 2)
+                                campaign["delivered_orders_attributed"] = int(group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum()) if delivered_col else placed_count
+                                campaign["rto_count_attributed"] = int(group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum()) if rto_col else 0
                                 
                                 print(f"   🛒 Shopify Orders matching campaign '{campaign['campaign_name']}': Total={placed_count}, COD Orders={cod_count} (COD Ratio={campaign['cod_ratio']}%) -> Realized Attributed RTO rate={campaign['rto_rate_attributed']}%", flush=True)
                                     
@@ -738,12 +782,10 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         blended_aov = new_state["average_order_value"]
 
                 # Calculate overall brand RTO rate for single sheet
-                blended_cod_ratio = 40.0
-                if "cod_orders" in df_canonical.columns:
-                    cod_col = df_canonical["cod_orders"]
-                    cod_count = int(cod_col.astype(str).str.upper().str.contains("COD|CASH").sum())
-                    blended_cod_ratio = round((cod_count / max(len(df_canonical), 1)) * 100, 2)
-                new_state["brand_rto_rate"] = round(blended_cod_ratio * 0.38, 2)
+                brand_rto, rto_present = calculate_df_rto_rate(df_canonical)
+                new_state["brand_rto_rate"] = brand_rto
+                if rto_present:
+                    rto_data_present = True
 
                 # Calculate repeat rate from customer type or customer id
                 cust_type_col = next((c for c in df_canonical.columns if "customer_type" in c or "user_type" in c or "type" in c), None) or next((c for c in df.columns if "customer_type" in c or "user_type" in c or "type" in c), None)
@@ -791,7 +833,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         
                         cod_ratio = round((cod_count / max(order_count, 1)) * 100, 2)
                         prepaid_ratio = round(100 - cod_ratio, 2)
-                        rto_rate_on_delivered = round(cod_ratio * 0.38, 2)
+                        # Calculate RTO rate using data-driven helper
+                        rto_rate_on_delivered, _ = calculate_df_rto_rate(group, fallback_cod_ratio=cod_ratio)
                         
                         # Calculate SKU-specific AOV
                         sku_aov = blended_aov
@@ -891,8 +934,16 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 revenue_sum = 0
                                 
                         roas = round(revenue_sum / max(spend, 1), 2) if revenue_sum > 0 else 3.0
-                        rto_pct = round(cod_ratio * 0.4, 2)
                         roas_src = "Shopify orders matching campaign name" if revenue_sum > 0 else "default baseline"
+                        
+                        status_col = find_col(group.columns, "status", "delivery status", "fulfillment status")
+                        rto_col = find_col(group.columns, "rto", "returned", "undelivered") or status_col
+                        delivered_col = find_col(group.columns, "delivered", "fulfilled") or status_col
+                        
+                        rto_pct, _ = calculate_df_rto_rate(group, fallback_cod_ratio=cod_ratio)
+                        rto_count_attr = int(group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum()) if rto_col else 0
+                        del_count_attr = int(group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum()) if delivered_col else placed_count
+
                         if not campaign:
                             campaign = {
                                 "campaign_id": camp_id_str,
@@ -908,8 +959,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "cod_order_count": cod_count,
                                 "cod_ratio": cod_ratio,
                                 "placed_orders_attributed": placed_count,
-                                "rto_count_attributed": 0,
-                                "delivered_orders_attributed": placed_count,
+                                "rto_count_attributed": rto_count_attr,
+                                "delivered_orders_attributed": del_count_attr,
                                 "rto_rate_attributed": rto_pct,
                                 "contribution_margin_after_rto": 25,
                                 "skus": [sku_name_str] if sku_name_str else []
@@ -923,6 +974,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             campaign["cod_ratio"] = cod_ratio
                             campaign["rto_rate_attributed"] = rto_pct
                             campaign["placed_orders_attributed"] = placed_count
+                            campaign["rto_count_attributed"] = rto_count_attr
+                            campaign["delivered_orders_attributed"] = del_count_attr
                             
             elif upload_source == "meta_ads":
                 if "campaign_id" in df_canonical.columns:

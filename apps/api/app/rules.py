@@ -22,7 +22,7 @@ SIGNAL_THRESHOLDS = {
     "MarginTrap": {"placed_roas_min": 3.5, "delivered_roas_max": 3.0, "severity": "high", "confidence": 0.86},
     "NewLaunchRisk": {"roas_max": 1.5, "frequency_max": 1.5, "severity": "medium", "confidence": 0.75},
     "AOVDilution": {"placed_roas_min": 3.0, "delivered_roas_max": 2.2, "severity": "medium", "confidence": 0.80},
-    "AudienceAudit": {"spend_min": 50000, "delivered_roas_max": 3.0, "placed_roas_min": 3.5, "severity": "high", "confidence": 0.89},
+    "AudienceAudit": {"spend_min": 50000, "delivered_roas_max": 3.0, "placed_roas_min": 1.5, "severity": "high", "confidence": 0.89},
     "ConcentrationRisk": {"share_min": 0.20, "projected_stockout_days_max": 14, "rto_rate_on_delivered_min": 18, "severity": "high", "confidence": 0.90},
     "StateRTOLeakage": {"rto_pct_min": 30, "total_orders_min": 10, "severity": "high", "confidence": 0.92},
     "CourierPerformanceWarning": {"rto_pct_min": 25, "total_orders_min": 10, "severity": "medium", "confidence": 0.84},
@@ -787,7 +787,6 @@ class SignalDetectionEngine:
                 )
 
         # --- AUDIENCE AUDIT (Decision #3) ---
-        print("DEBUG: Entering AudienceAudit loop, campaigns count:", len(campaigns))
         for campaign in campaigns:
             c_name = campaign["campaign_name"]
             if "testing" in c_name.lower() or "audience" in c_name.lower():
@@ -795,17 +794,17 @@ class SignalDetectionEngine:
                 placed = campaign.get("roas_on_placed_orders", 0.0)
                 delivered = campaign.get("roas_on_delivered_orders", 0.0)
                 audit = SIGNAL_THRESHOLDS["AudienceAudit"]
-                print(f"DEBUG: Checking {c_name} - spend: {spend}, placed: {placed}, delivered: {delivered}")
-                print(f"DEBUG: Thresholds - spend_min: {audit['spend_min']}, placed_roas_min: {audit['placed_roas_min']}, delivered_roas_max: {audit['delivered_roas_max']}")
                 
                 if spend >= audit["spend_min"] and delivered <= audit["delivered_roas_max"] and placed >= audit["placed_roas_min"]:
-                    print("DEBUG: Conditions met! Appending AudienceAudit signal.")
                     base_conf = audit["confidence"]
                     conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
                     
-                    # Calculate loss due to RTO compression
-                    loss = round(spend * (placed - delivered) * 0.25)
+                    # Calculate lifetime Revenue Gap due to RTO/cancellations
+                    loss = round(spend * (placed - delivered))
                     loss = max(loss, 5000)
+                    
+                    # Read the attributed RTO rate from tasks.py
+                    attr_rto = campaign.get("rto_rate_on_delivered", campaign.get("rto_rate_attributed", 0.0))
                     
                     signals.append(
                         Signal(
@@ -815,17 +814,17 @@ class SignalDetectionEngine:
                             severity=audit["severity"],
                             confidence_score=conf_score,
                             business_impact=loss,
-                            impact_label=f"Rs {loss:,.0f} RTO waste from cold traffic",
+                            impact_label=f"Rs {loss:,.0f} unrealized revenue from RTO/cancellations",
                             recommendation="Audit or pause this campaign. Narrow targeting to prepaid-only audiences or add COD verification.",
                             affected_campaigns=[c_name],
                             affected_skus=campaign.get("skus", []),
-                            rule="spend >= 50000 AND delivered_roas <= 3.0 AND placed_roas >= 3.5",
-                            explanation="Testing campaign has high volume but returns collapse realized profitability due to heavy COD preferences.",
+                            rule="spend >= 50000 AND delivered_roas <= 3.0 AND placed_roas >= 1.5",
+                            explanation="Testing campaign spend produces sub-optimal returns due to high return-to-origin (RTO) or cancellation rates on paper.",
                             cross_system_signals=[
                                 f"Campaign spend is Rs {spend:,.2f}",
                                 f"Placed ROAS is {placed}x",
                                 f"Realized Delivered ROAS is {delivered}x",
-                                f"Attributed RTO rate is {campaign.get('rto_rate_on_delivered', 0.0)}%"
+                                f"Attributed RTO rate is {attr_rto}%"
                             ],
                             risk_projection=[
                                 {"horizon": "24 hr", "impact": "Spend on unprofitable cold traffic continues"},
