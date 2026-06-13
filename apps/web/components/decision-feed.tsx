@@ -27,7 +27,8 @@ const iconBySignal = {
   CreativeFatigue: BarChart3,
   MarginLeakage: ShieldAlert,
   CampaignRTOSpike: TrendingUp,
-  ScalingOpportunity: Users
+  ScalingOpportunity: Users,
+  DataGapWarning: ShieldAlert
 };
 
 function detectUploadSourceFromSheets(sheetNames: string[]): UploadSource {
@@ -65,7 +66,8 @@ const labelBySignal = {
   CampaignRTOSpike: "HIGH",
   CreativeFatigue: "INFO",
   MarginLeakage: "HIGH",
-  ScalingOpportunity: "OPPORTUNITY"
+  ScalingOpportunity: "OPPORTUNITY",
+  DataGapWarning: "WARNING"
 };
 
 const metricColorBySeverity: Record<Severity, string> = {

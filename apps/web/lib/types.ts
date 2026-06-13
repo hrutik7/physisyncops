@@ -5,7 +5,8 @@ export type SignalType =
   | "CreativeFatigue"
   | "MarginLeakage"
   | "CampaignRTOSpike"
-  | "ScalingOpportunity";
+  | "ScalingOpportunity"
+  | "DataGapWarning";
 
 export type UploadSource = "shopify_orders" | "meta_ads" | "inventory" | "creative_performance" | "customer_signals";
 

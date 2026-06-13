@@ -209,3 +209,126 @@ def infer_goal_alignment(decision: Decision) -> str:
     if "creative" in issue:
         return "growth"
     return "retention"
+
+
+def carry_forward_active_decisions(db: Session, brand_id: str, previous_snapshot_id: str, new_snapshot_id: str) -> None:
+    # Query all decisions from the previous snapshot
+    prev_decisions = db.query(Decision).filter(Decision.snapshot_id == previous_snapshot_id).all()
+    
+    for old_dec in prev_decisions:
+        # We only carry forward decisions that the operator interacted with (i.e. not pending)
+        if old_dec.state == "pending":
+            continue
+            
+        # Check if a decision for the same rule/title was already created in the new snapshot
+        # (e.g. because the rule fired and it was created in the signals loop)
+        already_created = db.query(Decision).filter(
+            Decision.snapshot_id == new_snapshot_id,
+            Decision.rule == old_dec.rule
+        ).first()
+        
+        if already_created:
+            # If it was already created, make sure its state and timeline are preserved
+            new_dec = already_created
+            new_dec.state = old_dec.state
+            new_dec.timeline = old_dec.timeline
+            
+            # Fetch old intervention
+            old_int = db.query(Intervention).filter(Intervention.decision_id == old_dec.id).first()
+            if old_int:
+                # Update or create new intervention
+                new_int = db.query(Intervention).filter(Intervention.decision_id == new_dec.id).first()
+                if new_int:
+                    new_int.status = old_int.status
+                    new_int.expected_effect = old_int.expected_effect
+                    new_int.verification_metric = old_int.verification_metric
+                    new_int.outcome = old_int.outcome
+                    new_int.updated_at = datetime.utcnow()
+                else:
+                    new_int = Intervention(
+                        decision_id=new_dec.id,
+                        brand_id=brand_id,
+                        action_type=old_int.action_type,
+                        status=old_int.status,
+                        expected_effect=old_int.expected_effect,
+                        verification_metric=old_int.verification_metric,
+                        outcome=old_int.outcome
+                    )
+                    db.add(new_int)
+                db.flush()
+                
+                # Fetch old scorecard
+                old_sc = db.query(VerificationScorecard).filter(VerificationScorecard.intervention_id == old_int.id).first()
+                if old_sc:
+                    new_sc = db.query(VerificationScorecard).filter(VerificationScorecard.intervention_id == new_int.id).first()
+                    if new_sc:
+                        new_sc.status = old_sc.status
+                        new_sc.score = old_sc.score
+                        new_sc.metrics = old_sc.metrics
+                        new_sc.summary = old_sc.summary
+                    else:
+                        new_sc = VerificationScorecard(
+                            intervention_id=new_int.id,
+                            decision_id=new_dec.id,
+                            brand_id=brand_id,
+                            score=old_sc.score,
+                            status=old_sc.status,
+                            metrics=old_sc.metrics,
+                            summary=old_sc.summary
+                        )
+                        db.add(new_sc)
+            continue
+            
+        # If it was NOT already created in the new snapshot, copy it!
+        new_dec = Decision(
+            snapshot_id=new_snapshot_id,
+            title=old_dec.title,
+            issue_type=old_dec.issue_type,
+            severity=old_dec.severity,
+            confidence_score=old_dec.confidence_score,
+            business_impact=old_dec.business_impact,
+            recommendation=old_dec.recommendation,
+            affected_campaigns=old_dec.affected_campaigns,
+            affected_skus=old_dec.affected_skus,
+            state=old_dec.state,
+            timeline=old_dec.timeline,
+            rule=old_dec.rule,
+            explanation=old_dec.explanation,
+            impact_label=old_dec.impact_label,
+            cross_system_signals=old_dec.cross_system_signals,
+            risk_projection=old_dec.risk_projection,
+            recommended_actions=old_dec.recommended_actions,
+            verification_signals=old_dec.verification_signals,
+            confidence_explanation=old_dec.confidence_explanation,
+            relationship_edges=old_dec.relationship_edges
+        )
+        db.add(new_dec)
+        db.flush()
+        
+        # Copy intervention and scorecard
+        old_int = db.query(Intervention).filter(Intervention.decision_id == old_dec.id).first()
+        if old_int:
+            new_int = Intervention(
+                decision_id=new_dec.id,
+                brand_id=brand_id,
+                action_type=old_int.action_type,
+                status=old_int.status,
+                expected_effect=old_int.expected_effect,
+                verification_metric=old_int.verification_metric,
+                outcome=old_int.outcome
+            )
+            db.add(new_int)
+            db.flush()
+            
+            old_sc = db.query(VerificationScorecard).filter(VerificationScorecard.intervention_id == old_int.id).first()
+            if old_sc:
+                new_sc = VerificationScorecard(
+                    intervention_id=new_int.id,
+                    decision_id=new_dec.id,
+                    brand_id=brand_id,
+                    score=old_sc.score,
+                    status=old_sc.status,
+                    metrics=old_sc.metrics,
+                    summary=old_sc.summary
+                )
+                db.add(new_sc)

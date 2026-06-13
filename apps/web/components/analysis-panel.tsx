@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { ArrowRight, Check, Circle, Eye, PackageOpen, TrendingUp, X } from "lucide-react";
+import { ArrowRight, Check, Circle, Eye, PackageOpen, TrendingUp, X, ShieldAlert } from "lucide-react";
 import { useOpentraStore } from "@/store/use-opentra-store";
 import { Decision, Severity } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -12,7 +12,8 @@ const iconBySignal = {
   CreativeFatigue: TrendingUp,
   MarginLeakage: TrendingUp,
   CampaignRTOSpike: TrendingUp,
-  ScalingOpportunity: TrendingUp
+  ScalingOpportunity: TrendingUp,
+  DataGapWarning: ShieldAlert
 };
 
 const severityCopy: Record<Severity, string> = {
@@ -41,6 +42,18 @@ function compactImpact(decision: Decision) {
   if (decision.id === "dec_creative_fatigue") return "Rs 28K efficiency loss";
   if (decision.id === "dec_scaling_opportunity") return "Rs 1.16L upside";
   return decision.impactLabel;
+}
+
+function formatSavedImpact(decision: Decision) {
+  if (decision.businessImpact) {
+    if (decision.businessImpact >= 100000) {
+      return `Rs ${(decision.businessImpact / 100000).toFixed(2)}L`;
+    }
+    return `Rs ${decision.businessImpact.toLocaleString("en-IN")}`;
+  }
+  const compact = compactImpact(decision);
+  if (!compact) return "Rs 0";
+  return compact.replace(/\s+(margin loss|revenue at risk|efficiency loss|upside|launch spend at risk|spend at risk|realized margin leakage|margin leakage detected|bundle margin leakage|incremental revenue projection|realized margin compression)/i, "");
 }
 
 export function AnalysisPanel() {
@@ -202,7 +215,7 @@ export function AnalysisPanel() {
                 <div>
                   <p className="text-[10px] font-bold text-[#68708a] uppercase tracking-wider">Actual Saved</p>
                   <p className="text-[15px] font-black text-[#07824b] mt-0.5">
-                    {decision.title.toLowerCase().includes("stockout") ? "Rs 1.48L" : "Rs 6.2K/day"}
+                    {formatSavedImpact(decision)}
                   </p>
                 </div>
               </div>
@@ -369,7 +382,7 @@ export function AnalysisPanel() {
                         <p className="text-[10px] font-bold text-[#68708a] uppercase tracking-wider">Actual Averted</p>
                         <p className={cn("text-lg font-black mt-1", decision.state === "successful" ? "text-[#07824b]" : "text-[#b86d00]")}>
                           {decision.state === "successful" 
-                            ? (decision.title.toLowerCase().includes("stockout") ? "Rs 1.48L" : "Rs 6.2K/day")
+                            ? formatSavedImpact(decision)
                             : "Rs 0"
                           }
                         </p>

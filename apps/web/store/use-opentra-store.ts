@@ -73,7 +73,7 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
   selectedFile: null,
   activeUploadSource: "shopify_orders",
   uploadedColumns: [],
-  brandId: typeof window !== "undefined" ? (localStorage.getItem("physisync_brand_id") || `brand_${Date.now()}`) : `brand_${Date.now()}`,
+  brandId: typeof window !== "undefined" ? (localStorage.getItem("physisync_brand_id") || "brand_unigo_real") : "brand_unigo_real",
   activeView: "Decision Feed",
 
   setActiveView: (view) => set({ activeView: view }),
@@ -131,16 +131,20 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
         set({ selectedDecisionId: data.decisions[0].id });
       }
     } catch (err: any) {
-      // Backend unavailable — fall back to local mock data so the UI is functional
-      console.warn("Backend unavailable, loading mock data:", err.message);
+      console.warn("Backend unavailable, keeping live state empty:", err.message);
       set({
-        ...operationalState,
+        brandName: "Uploaded Brand",
+        snapshots: [],
+        skus: [],
+        campaigns: [],
+        customerSegments: [],
+        creatives: [],
+        decisions: [],
+        mappingSuggestions: [],
+        selectedDecisionId: "",
         loading: false,
-        error: null
+        error: "Backend unavailable. Start the API and upload a workbook to generate decisions."
       });
-      if (operationalState.decisions && operationalState.decisions.length > 0) {
-        set({ selectedDecisionId: operationalState.decisions[0].id });
-      }
     }
   },
   

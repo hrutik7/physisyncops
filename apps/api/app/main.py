@@ -34,6 +34,7 @@ from .operating_layer import (
     persist_ontology,
     upsert_unit_economics_from_state,
     why_analysis,
+    carry_forward_active_decisions,
 )
 from .rules import detect_signals, SignalDetectionEngine
 from .verification import infer_execution, MonitoringEngine
@@ -55,6 +56,10 @@ app.add_middleware(
 def display_name_from_brand_id(brand_id: str) -> str:
     clean = re.sub(r"^brand[_-]?", "", brand_id).replace("_", " ").replace("-", " ").strip()
     return clean.title() if clean else "Uploaded Brand"
+
+
+def normalize_sheet_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
 
 
 @app.on_event("startup")
@@ -256,8 +261,9 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
 async def preview_upload(upload_source: str, brand_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     xls = pd.ExcelFile(file.file)
     sheet_names = xls.sheet_names
+    normalized_sheets = {normalize_sheet_name(s): s for s in sheet_names}
     
-    is_multi_sheet = len(sheet_names) > 1 or any(s in sheet_names for s in ["shopify_orders", "meta_ads", "inventory"])
+    is_multi_sheet = len(sheet_names) > 1 or any(normalize_sheet_name(s) in normalized_sheets for s in ["shopify_orders", "shopify", "meta_ads", "meta", "inventory"])
     if is_multi_sheet:
         # For multi-sheet workbook, preview columns of shopify_orders sheet by default
         preview_sheet = next((s for s in sheet_names if "shopify" in s.lower() or "order" in s.lower()), sheet_names[0])
@@ -574,6 +580,8 @@ def update_state_sandbox(payload: SandboxUpdatePayload, brand_id: str, db: Sessi
             "roas_on_delivered_orders": float(s.get("roasOnDeliveredOrders", s.get("roas_on_delivered_orders", 0.0)))
         })
         
+    new_state["rto_data_present"] = True
+    
     # Create snapshot
     snapshot = BusinessSnapshot(
         brand_id=brand_id,
@@ -654,6 +662,9 @@ def update_state_sandbox(payload: SandboxUpdatePayload, brand_id: str, db: Sessi
         persist_ontology(db, brand_id, decision)
         intervention = ensure_intervention(db, brand_id, decision, "recommended")
         ensure_scorecard(db, brand_id, decision, intervention, "pending")
+        
+    if previous_snapshot:
+        carry_forward_active_decisions(db, brand_id, previous_snapshot.id, snapshot.id)
         
     db.commit()
     return {"status": "success", "snapshot_id": snapshot.id}

@@ -1,4 +1,4 @@
-import { SIGNAL_THRESHOLDS, VERIFICATION_THRESHOLDS } from "./rules";
+  import { SIGNAL_THRESHOLDS, VERIFICATION_THRESHOLDS } from "./rules";
 import { OperationalState } from "./types";
 
 export const operationalState: OperationalState = {
@@ -186,50 +186,6 @@ export const operationalState: OperationalState = {
         { from: "COD orders", to: "RTO probability", label: "elevates", strength: "strong" },
         { from: "RTO probability", to: "Realized ROAS", label: "reduces to 2.1x", strength: "strong" },
         { from: "Realized ROAS", to: "Margin", label: "compresses to 8%", strength: "strong" }
-      ]
-    },
-    {
-      id: "dec_inventory_risk",
-      title: "Velar Runner stockout risk in 5.6 days",
-      signalType: "InventoryRisk",
-      issueType: "Inventory pressure",
-      severity: "high",
-      confidenceScore: SIGNAL_THRESHOLDS.inventoryRisk.confidence,
-      businessImpact: 148000,
-      impactLabel: "Rs 1.48L revenue at risk over 72 hr",
-      explanation: "Spend is accelerating while Velar Runner inventory is below one week of cover.",
-      rule: "projected_stockout_days <= 7 AND spend_growth_percent >= 15",
-      recommendation: "Reduce spend by 15% or reorder within 48 hours.",
-      affectedCampaigns: ["Velar-Static-V1"],
-      affectedSkus: ["Velar Runner"],
-      timestamp: "10:03 AM",
-      state: "pending",
-      crossSystemSignals: ["SKU velocity is 32 units/day", "Inventory left is 180 units", "Ad spend grew 22% week over week"],
-      riskProjection: [
-        { horizon: "24 hr", impact: "Inventory cover falls to 4.6 days" },
-        { horizon: "48 hr", impact: "Reorder window becomes operationally tight" },
-        { horizon: "72 hr", impact: "Paid traffic may drive demand into stockout" }
-      ],
-      recommendedActions: ["Create reorder today", "Reduce Velar prospecting spend by 15%", "Keep prepaid retargeting live"],
-      verificationSignals: [
-        {
-          label: "Inventory reorder verification",
-          condition: `inventory level increases >= ${VERIFICATION_THRESHOLDS.inventoryReorder.inventoryLevelIncreaseMin}% AND projected stockout days improves >= ${VERIFICATION_THRESHOLDS.inventoryReorder.projectedStockoutDaysImprovementMin}`,
-          confidence: VERIFICATION_THRESHOLDS.inventoryReorder.confidence
-        },
-        {
-          label: "Spend reduction verification",
-          condition: `campaign spend decreases >= ${VERIFICATION_THRESHOLDS.spendReduction.campaignSpendDecreaseMin}%`,
-          confidence: VERIFICATION_THRESHOLDS.spendReduction.confidence
-        }
-      ],
-      timeline: [
-        { id: "evt_3", time: "10:03 AM", title: "Inventory risk detected", description: "Projected stockout is 5.6 days with spend up 22%.", kind: "signal" }
-      ],
-      confidenceExplanation: "Both explicit thresholds fired with current-state data. Baseline mode prevents comparison inferences until the next upload.",
-      relationshipEdges: [
-        { from: "Velar-Static-V1", to: "Velar Runner velocity", label: "drives demand", strength: "strong" },
-        { from: "Velocity", to: "Inventory pressure", label: "stockout in 5.6 days", strength: "strong" }
       ]
     },
     {

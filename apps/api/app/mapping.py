@@ -1,14 +1,14 @@
 from difflib import SequenceMatcher
 
 CANONICAL_COLUMNS: dict[str, list[str]] = {
-    "revenue": ["gross_sales", "total_sales", "revenue", "sales_amount"],
-    "rto_count": ["rto", "returned_orders", "undelivered", "return_count"],
-    "campaign_id": ["campaign_id", "ad_set_id", "campaign_name"],
-    "sku_id": ["sku", "product_id", "item_code", "variant_id"],
-    "cod_orders": ["cod_count", "cash_orders", "cod"],
-    "delivered_orders": ["delivered", "fulfilled", "confirmed_delivered"],
+    "revenue": ["gross_sales", "total_sales", "revenue", "sales_amount", "total_amt", "total_amount", "amount"],
+    "rto_count": ["rto", "returned_orders", "undelivered", "return_count", "status"],
+    "campaign_id": ["campaign_id", "ad_set_id", "campaign_name", "campaign"],
+    "sku_id": ["sku", "sku_code", "product_id", "item_code", "variant_id"],
+    "cod_orders": ["cod_count", "cash_orders", "cod", "payment_type", "payment_method"],
+    "delivered_orders": ["delivered", "fulfilled", "confirmed_delivered", "status"],
     "order_status": ["status", "delivery_status", "fulfillment_status"],
-    "ad_spend": ["spend", "amount_spent", "campaign_spend"],
+    "ad_spend": ["spend", "amount_spent", "amount_spent_inr", "campaign_spend"],
 }
 
 REQUIRED_FIELDS = {"revenue", "campaign_id", "sku_id", "delivered_orders"}

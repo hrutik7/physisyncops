@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import json
 import re
+import math
 from typing import Any
 from datetime import datetime, timezone
 
@@ -10,7 +11,6 @@ from .db import SessionLocal
 from .models import BusinessSnapshot, Decision, Brand, UnitEconomics
 from .rules import SignalDetectionEngine, DataFreshnessValidator
 from .verification import MonitoringEngine
-from .demo_data import DEMO_STATE
 from .llm import LLMEnrichmentService
 from .operating_layer import (
     ensure_default_goals,
@@ -19,12 +19,23 @@ from .operating_layer import (
     persist_connector_events,
     persist_ontology,
     upsert_unit_economics_from_state,
+    carry_forward_active_decisions,
 )
 
 
 def display_name_from_brand_id(brand_id: str) -> str:
     clean = re.sub(r"^brand[_-]?", "", brand_id).replace("_", " ").replace("-", " ").strip()
     return clean.title() if clean else "Uploaded Brand"
+
+
+def empty_uploaded_state(brand_id: str) -> dict[str, Any]:
+    return {
+        "brand_name": display_name_from_brand_id(brand_id),
+        "skus": [],
+        "campaigns": [],
+        "customer_segments": [],
+        "creatives": [],
+    }
 
 
 def calculate_sku_margin_params(db, brand_id: str, sku_name_or_id: str, sku_aov: float):
@@ -65,6 +76,79 @@ def calculate_sku_margin_params(db, brand_id: str, sku_name_or_id: str, sku_aov:
         return 28.0, 0.65, 0.40
 
 
+def normalize_header(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()).lower()
+
+
+def normalize_sheet_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def find_col(columns, *needles: str):
+    normalized = {column: normalize_header(column) for column in columns}
+    for needle in needles:
+        clean_needle = normalize_header(needle)
+        for column, clean_column in normalized.items():
+            if clean_column == clean_needle:
+                return column
+    for needle in needles:
+        clean_needle = normalize_header(needle)
+        for column, clean_column in normalized.items():
+            if clean_needle in clean_column:
+                return column
+    return None
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def safe_series_sum(series: pd.Series, default: float = 0.0) -> float:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return default
+    return safe_float(values.sum(), default)
+
+
+def safe_series_mean(series: pd.Series, default: float = 0.0) -> float:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return default
+    return safe_float(values.mean(), default)
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def workbook_has_rto_status_sheet(xls: pd.ExcelFile, sheet_names: list[str]) -> tuple[bool, str | None]:
+    status_aliases = ("status", "delivery status", "fulfillment status", "rto", "returned", "undelivered")
+    for sheet_name in sheet_names:
+        if not any(alias in normalize_sheet_name(sheet_name) for alias in ("shopify", "order")):
+            continue
+        frame = pd.read_excel(xls, sheet_name=sheet_name, nrows=1)
+        matched_col = find_col([str(c).strip().lower() for c in frame.columns], *status_aliases)
+        if matched_col:
+            return True, f"shopify_orders.{matched_col}"
+    return False, None
+
+
 @celery_app.task(name="app.tasks.process_excel_upload_task", bind=True)
 def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: dict[str, str], file_path: str) -> dict:
     self.update_state(state="PROGRESS", meta={"step": "Parsing Excel workbook sheets"})
@@ -89,11 +173,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         next_version = 1 if previous_snapshot is None else previous_snapshot.snapshot_version + 1
         is_baseline = previous_snapshot is None
         
-        # Initialize new state from previous snapshot's state or DEMO_STATE as a baseline
+        # Initialize real uploads from a clean state so demo SKUs/campaigns never leak into decisions.
         if previous_snapshot is not None:
             new_state = json.loads(json.dumps(previous_snapshot.state))
         else:
-            new_state = json.loads(json.dumps(DEMO_STATE))
+            new_state = empty_uploaded_state(brand_id)
             
         if previous_snapshot is None:
             new_state["brand_name"] = display_name_from_brand_id(brand_id)
@@ -121,8 +205,8 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         except Exception as e:
             print(f"⚠️ Error checking custom upload SKUs: {e}", flush=True)
 
-        if is_custom_upload:
-            print("🚀 [DYNAMIC INGESTION] Custom brand upload detected! Clearing Unigo mock data templates.", flush=True)
+        if is_custom_upload or previous_snapshot is None:
+            print("🚀 [DYNAMIC INGESTION] Real workbook upload detected! Clearing mock data templates.", flush=True)
             new_state["brand_name"] = display_name_from_brand_id(brand_id)
             new_state["skus"] = []
             new_state["campaigns"] = []
@@ -132,6 +216,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         is_multi_sheet = len(sheet_names) > 1 or any(s in sheet_names for s in ["shopify_orders", "meta_ads", "inventory"])
         
         freshness = 1.0 # Default full freshness
+        rto_data_present = False
         
         print("\n" + "=" * 80, flush=True)
         print(f"🚀 [DYNAMIC INGESTION] STARTED CALCULATIONS FOR BRAND: {brand_id}", flush=True)
@@ -143,18 +228,45 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         if is_multi_sheet:
             self.update_state(state="PROGRESS", meta={"step": "Ingesting multi-sheet workbook"})
             sheets = {s: pd.read_excel(xls, sheet_name=s) for s in sheet_names}
+            sheet_lookup = {normalize_sheet_name(s): s for s in sheet_names}
+
+            def resolve_sheet(*aliases: str):
+                for alias in aliases:
+                    clean_alias = normalize_sheet_name(alias)
+                    if clean_alias in sheet_lookup:
+                        return sheets[sheet_lookup[clean_alias]]
+                for sheet_name in sheet_names:
+                    clean_sheet = normalize_sheet_name(sheet_name)
+                    if any(normalize_sheet_name(alias) in clean_sheet for alias in aliases):
+                        return sheets[sheet_name]
+                return None
             
             # --- 1. Parse inventory sheet ---
             # Columns: sku, stock_left, daily_velocity, reorder_level, projected_stockout_days
-            if "inventory" in sheets:
+            inv_df = resolve_sheet("inventory", "stock")
+            if inv_df is not None:
                 print("🔍 [STEP 1/4] Processing 'inventory' sheet dynamically...", flush=True)
-                inv_df = sheets["inventory"]
+                
+                # Align headers if the first few columns are Unnamed (e.g. from title rows)
+                if any("unnamed" in str(c).lower() for c in inv_df.columns):
+                    header_row_idx = None
+                    for idx, row in inv_df.iterrows():
+                        row_vals = [str(v).strip().lower() for v in row.values if v is not None]
+                        if any(h in row_vals for h in ["sr no", "sr no.", "code", "opening stock", "usable stock"]):
+                            header_row_idx = idx
+                            break
+                    if header_row_idx is not None:
+                        inv_df.columns = [str(c).strip() for c in inv_df.iloc[header_row_idx]]
+                        inv_df = inv_df.iloc[header_row_idx + 1:].reset_index(drop=True)
+
                 inv_df.columns = [str(c).strip().lower() for c in inv_df.columns]
                 
-                sku_col = next((c for c in inv_df.columns if "sku" in c or "variant" in c), None)
-                stock_col = next((c for c in inv_df.columns if "stock" in c or "left" in c or "inventory" in c), None)
-                velocity_col = next((c for c in inv_df.columns if "velocity" in c or "daily" in c), None)
-                reorder_col = next((c for c in inv_df.columns if "reorder" in c or "level" in c or "threshold" in c), None)
+                sku_col = next((c for c in inv_df.columns if any(alias in c for alias in ["sku", "variant", "code", "item_code", "sku_code"])), None)
+                stock_col = next((c for c in inv_df.columns if "usable" in c), None)
+                if not stock_col:
+                    stock_col = next((c for c in inv_df.columns if "stock" in c or "left" in c or "inventory" in c or "qty" in c or "available" in c), None)
+                velocity_col = next((c for c in inv_df.columns if any(alias in c for alias in ["velocity", "daily", "average", "demand"])), None)
+                reorder_col = next((c for c in inv_df.columns if any(alias in c for alias in ["reorder", "level", "threshold", "norms"])), None)
                 stockout_col = next((c for c in inv_df.columns if "stockout" in c or "projected" in c), None)
                 
                 if sku_col:
@@ -181,12 +293,27 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             }
                             new_state["skus"].append(sku)
                             
-                        if stock_col and pd.notna(row[stock_col]): sku["inventory_left"] = int(row[stock_col])
-                        if velocity_col and pd.notna(row[velocity_col]): sku["daily_velocity"] = float(row[velocity_col])
-                        if reorder_col and pd.notna(row[reorder_col]): sku["reorder_threshold"] = int(row[reorder_col])
+                        if stock_col and pd.notna(row[stock_col]):
+                            try:
+                                sku["inventory_left"] = int(float(row[stock_col]))
+                            except (ValueError, TypeError):
+                                sku["inventory_left"] = 0
+                        if velocity_col and pd.notna(row[velocity_col]):
+                            try:
+                                sku["daily_velocity"] = float(row[velocity_col])
+                            except (ValueError, TypeError):
+                                sku["daily_velocity"] = 0.0
+                        if reorder_col and pd.notna(row[reorder_col]):
+                            try:
+                                sku["reorder_threshold"] = int(float(row[reorder_col]))
+                            except (ValueError, TypeError):
+                                sku["reorder_threshold"] = 0
                         
                         if stockout_col and pd.notna(row[stockout_col]):
-                            sku["projected_stockout_days"] = float(row[stockout_col])
+                            try:
+                                sku["projected_stockout_days"] = float(row[stockout_col])
+                            except (ValueError, TypeError):
+                                sku["projected_stockout_days"] = 99.0
                         elif sku["daily_velocity"] > 0:
                             sku["projected_stockout_days"] = round(sku["inventory_left"] / sku["daily_velocity"], 1)
                         
@@ -194,9 +321,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             
             # --- 2. Parse meta_ads sheet ---
             # Columns: campaign_name, creative_hook, daily_spend, roas, ctr_percent, frequency, cpa, status
-            if "meta_ads" in sheets:
+            ads_df = resolve_sheet("meta_ads", "meta", "facebook_ads", "ads")
+            if ads_df is not None:
                 print("\n🔍 [STEP 2/4] Processing 'meta_ads' sheet dynamically...", flush=True)
-                ads_df = sheets["meta_ads"]
                 ads_df.columns = [str(c).strip().lower() for c in ads_df.columns]
                 
                 camp_col = next((c for c in ads_df.columns if "campaign" in c or "name" in c), None)
@@ -242,33 +369,39 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             
                         prev_spend = campaign["spend"]
                         if spend_col:
-                            campaign["spend"] = float(group[spend_col].sum())
+                            campaign["spend"] = safe_series_sum(group[spend_col], campaign.get("spend", 0.0))
                             if prev_spend > 0:
                                 campaign["spend_growth_percent"] = round(((campaign["spend"] - prev_spend) / prev_spend) * 100, 2)
-                        if roas_col: campaign["roas_on_placed_orders"] = float(group[roas_col].mean())
+                        if roas_col:
+                            campaign["roas_on_placed_orders"] = safe_series_mean(group[roas_col], campaign.get("roas_on_placed_orders", 3.0))
+                            campaign["roas_source"] = "Meta Ads Manager ('meta_ads' sheet)"
+                        else:
+                            campaign["roas_source"] = "default baseline"
                         if ctr_drop_col:
-                            campaign["ctr_drop_percent"] = float(group[ctr_drop_col].mean())
+                            campaign["ctr_drop_percent"] = safe_series_mean(group[ctr_drop_col], campaign.get("ctr_drop_percent", 0.0))
                             campaign["ctr_drop_source"] = ctr_drop_col
                         if ctr_col:
                             prev_ctr = campaign.get("ctr", 0)
-                            campaign["ctr"] = float(group[ctr_col].mean())
+                            campaign["ctr"] = safe_series_mean(group[ctr_col], campaign.get("ctr", 0.0))
                             if has_prior_campaign and prev_ctr > 0 and not ctr_drop_col:
                                 campaign["ctr_drop_percent"] = round(((prev_ctr - campaign["ctr"]) / prev_ctr) * 100, 2)
                                 campaign["ctr_drop_source"] = "previous_snapshot_ctr"
-                        if freq_col: campaign["frequency"] = float(group[freq_col].mean())
+                        if freq_col: campaign["frequency"] = safe_series_mean(group[freq_col], campaign.get("frequency", 2.5))
                         
                         print(f"   📢 Campaign '{camp_name_str}': Total Spend=Rs {campaign['spend']} (Growth={campaign['spend_growth_percent']}%), Placed ROAS={campaign['roas_on_placed_orders']}x, CTR={campaign['ctr']}%, Freq={campaign['frequency']}", flush=True)
                         
             # --- 3. Parse customer_signals sheet ---
             # Columns: sku, repeat_rate_percent, return_rate_percent, review_sentiment, cod_ratio_percent, prepaid_ratio_percent
-            if "customer_signals" in sheets:
+            cust_df = resolve_sheet("customer_signals", "customer")
+            if cust_df is not None:
                 print("\n🔍 [STEP 3/4] Processing 'customer_signals' sheet dynamically...", flush=True)
-                cust_df = sheets["customer_signals"]
                 cust_df.columns = [str(c).strip().lower() for c in cust_df.columns]
                 
                 sku_col = next((c for c in cust_df.columns if "sku" in c or "variant" in c), None)
                 repeat_col = next((c for c in cust_df.columns if "repeat" in c or "rate" in c), None)
                 return_col = next((c for c in cust_df.columns if "return" in c or "rto" in c), None)
+                if return_col is not None and len(cust_df) > 0:
+                    rto_data_present = True
                 cod_col = next((c for c in cust_df.columns if "cod" in c or "ratio" in c), None)
                 prepaid_col = next((c for c in cust_df.columns if "prepaid" in c), None)
                 
@@ -316,16 +449,23 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         
             # --- 4. Parse shopify_orders sheet ---
             # Columns: order_id, order_date, sku, city, payment_mode, revenue, customer_type
-            if "shopify_orders" in sheets:
+            orders_df = resolve_sheet("shopify_orders", "shopify", "orders")
+            if orders_df is not None:
                 print("\n🔍 [STEP 4/4] Processing 'shopify_orders' sheet dynamically...", flush=True)
-                orders_df = sheets["shopify_orders"]
                 orders_df.columns = [str(c).strip().lower() for c in orders_df.columns]
                 
-                sku_col = next((c for c in orders_df.columns if "sku" in c or "variant" in c), None)
-                pm_col = next((c for c in orders_df.columns if "payment" in c or "mode" in c or "method" in c), None)
-                rto_col = next((c for c in orders_df.columns if "rto" in c or "returned" in c or "undelivered" in c), None)
-                delivered_col = next((c for c in orders_df.columns if "delivered" in c or "fulfilled" in c), None)
-                revenue_col = next((c for c in orders_df.columns if "revenue" in c or "total" in c or "amount" in c or "price" in c), None)
+                sku_col = find_col(orders_df.columns, "sku code", "sku", "variant", "item code")
+                pm_col = find_col(orders_df.columns, "payment type", "payment method", "payment mode", "method")
+                status_col = find_col(orders_df.columns, "status", "delivery status", "fulfillment status")
+                rto_col = find_col(orders_df.columns, "rto", "returned", "undelivered") or status_col
+                delivered_col = find_col(orders_df.columns, "delivered", "fulfilled") or status_col
+                if rto_col is not None and delivered_col is not None and len(orders_df) > 0:
+                    rto_data_present = True
+                    new_state["rto_status_source"] = f"shopify_orders.{rto_col}"
+                revenue_col = find_col(orders_df.columns, "total amt", "total amount", "revenue", "amount", "price")
+                product_col = find_col(orders_df.columns, "name of the product", "product name", "product", "title")
+                qty_col = find_col(orders_df.columns, "qty", "quantity", "units")
+                order_date_col = find_col(orders_df.columns, "orders date", "order date", "date")
                 cust_type_col = next((c for c in orders_df.columns if "customer_type" in c or "user_type" in c or "type" in c), None)
                 cust_id_col = next((c for c in orders_df.columns if "customer" in c or "email" in c or "phone" in c or "user" in c), None)
 
@@ -338,10 +478,13 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
 
                 # Calculate overall brand-level RTO fallback
                 if delivered_col and rto_col:
-                    total_delivered = int(orders_df[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum())
-                    total_rto = int(orders_df[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum())
-                    if total_delivered > 0:
-                        new_state["brand_rto_rate"] = round((total_rto / total_delivered) * 100, 2)
+                    delivered_mask = orders_df[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"])
+                    rto_mask = orders_df[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"])
+                    total_delivered = int(delivered_mask.sum())
+                    total_rto = int(rto_mask.sum())
+                    total_resolved = total_delivered + total_rto
+                    if total_resolved > 0:
+                        new_state["brand_rto_rate"] = round((total_rto / total_resolved) * 100, 2)
                         print(f"   📈 Brand-level Blended RTO rate calculated: {new_state['brand_rto_rate']}%", flush=True)
 
                 # Calculate overall brand-level repeat purchase rate
@@ -357,6 +500,66 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 new_state["brand_repeat_rate"] = brand_repeat_rate
                 print(f"   📈 Brand-level Repeat Purchase Rate calculated: {brand_repeat_rate}%", flush=True)
 
+                # State-level profitability map (Decision #5)
+                if "state" in orders_df.columns and pm_col and status_col:
+                    orders_df["is_cod"] = orders_df[pm_col].astype(str).str.upper().str.contains("COD|CASH")
+                    orders_df["is_rto"] = orders_df[status_col].astype(str).str.upper().str.contains("RTO|RETURN")
+                    
+                    state_grp = orders_df.groupby("state")
+                    state_list = []
+                    for state_name, group in state_grp:
+                        tot_ord = len(group)
+                        if tot_ord > 5:
+                            cod_cnt = int(group["is_cod"].sum())
+                            rto_cnt = int(group["is_rto"].sum())
+                            cod_pct = round((cod_cnt / tot_ord) * 100, 2)
+                            rto_pct = round((rto_cnt / tot_ord) * 100, 2)
+                            
+                            deliv_rev = 0.0
+                            if revenue_col:
+                                deliv_mask = ~group[status_col].astype(str).str.upper().str.contains("RTO|RETURN|CANCEL")
+                                deliv_rev = round(float(pd.to_numeric(group.loc[deliv_mask, revenue_col], errors="coerce").sum()), 2)
+                                
+                            state_list.append({
+                                "state": str(state_name).strip(),
+                                "total_orders": tot_ord,
+                                "cod_pct": cod_pct,
+                                "rto_pct": rto_pct,
+                                "delivered_revenue": deliv_rev
+                            })
+                    new_state["state_profitability"] = state_list
+
+                # Courier performance ranking (Decision #6)
+                courier_col = find_col(orders_df.columns, "courier partner", "courier", "delivery partner", "carrier")
+                transit_col = find_col(orders_df.columns, "no of days required", "transit days", "delivery days")
+                if courier_col and status_col:
+                    orders_df["is_rto"] = orders_df[status_col].astype(str).str.upper().str.contains("RTO|RETURN")
+                    if transit_col:
+                        orders_df["transit_days"] = pd.to_numeric(orders_df[transit_col].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+                    else:
+                        orders_df["transit_days"] = None
+                        
+                    courier_grp = orders_df.groupby(courier_col)
+                    courier_list = []
+                    for courier_name, group in courier_grp:
+                        tot_ord = len(group)
+                        if tot_ord > 5:
+                            rto_cnt = int(group["is_rto"].sum())
+                            rto_pct = round((rto_cnt / tot_ord) * 100, 2)
+                            avg_days = None
+                            if "transit_days" in group.columns:
+                                days_val = group["transit_days"].dropna()
+                                if not days_val.empty:
+                                    avg_days = round(float(days_val.mean()), 1)
+                                    
+                            courier_list.append({
+                                "courier": str(courier_name).strip(),
+                                "total_orders": tot_ord,
+                                "rto_pct": rto_pct,
+                                "avg_days": avg_days
+                            })
+                    new_state["courier_performance"] = courier_list
+
                 if sku_col:
                     grouped = orders_df.groupby(sku_col)
                     for sku_name, group in grouped:
@@ -371,9 +574,54 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             sku_orders_count = len(group)
                             sku_aov = round(float(sku_rev) / max(sku_orders_count, 1), 2) if sku_orders_count > 0 else blended_aov
                         
-                        sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == sku_name_str.lower() or s["sku_id"].lower() == sku_name_str.lower()), None)
-                        if sku_entity:
+                        sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == sku_name_str.lower() or s["sku_id"].lower() == sku_name_str.lower() or s["sku_id"].lower() == f"sku-{sku_name_str.lower()}"), None)
+                        if not sku_entity:
+                            product_name = sku_name_str
+                            if product_col and product_col in group.columns:
+                                product_values = group[product_col].dropna()
+                                if not product_values.empty:
+                                    product_name = str(product_values.mode().iloc[0] if not product_values.mode().empty else product_values.iloc[0]).strip()
+                            qty_values = pd.to_numeric(group[qty_col], errors="coerce").fillna(1) if qty_col and qty_col in group.columns else pd.Series([1] * len(group))
+                            days_count = 1
+                            if order_date_col and order_date_col in orders_df.columns:
+                                date_values = pd.to_datetime(orders_df[order_date_col], errors="coerce").dropna()
+                                if not date_values.empty:
+                                    days_count = max((date_values.max().date() - date_values.min().date()).days + 1, 1)
+                            velocity = round(safe_float(qty_values.sum()) / days_count, 2)
+                            sku_entity = {
+                                "sku_id": sku_name_str,
+                                "name": product_name,
+                                "inventory_left": 0,
+                                "daily_velocity": velocity,
+                                "reorder_threshold": 0,
+                                "projected_stockout_days": 99.0,
+                                "contribution_margin_after_rto": 25,
+                                "average_order_value": sku_aov,
+                                "spend_growth_percent": 0.0,
+                                "campaigns": [],
+                                "inventory_source": "missing_inventory_sheet"
+                            }
+                            new_state.setdefault("skus", []).append(sku_entity)
+                        else:
                             sku_entity["average_order_value"] = sku_aov
+                            
+                            # Dynamically resolve product name for SKU from inventory
+                            if product_col and product_col in group.columns:
+                                product_values = group[product_col].dropna()
+                                if not product_values.empty:
+                                    product_name = str(product_values.mode().iloc[0] if not product_values.mode().empty else product_values.iloc[0]).strip()
+                                    sku_entity["name"] = product_name
+                            
+                            # Dynamic velocity fallback
+                            qty_values = pd.to_numeric(group[qty_col], errors="coerce").fillna(1) if qty_col and qty_col in group.columns else pd.Series([1] * len(group))
+                            days_count = 1
+                            if order_date_col and order_date_col in orders_df.columns:
+                                date_values = pd.to_datetime(orders_df[order_date_col], errors="coerce").dropna()
+                                if not date_values.empty:
+                                    days_count = max((date_values.max().date() - date_values.min().date()).days + 1, 1)
+                            velocity = round(safe_float(qty_values.sum()) / days_count, 2)
+                            if sku_entity.get("daily_velocity", 0.0) <= 0.0:
+                                sku_entity["daily_velocity"] = velocity
 
                         # Calculate SKU-specific repeat rate
                         sku_repeat_rate = brand_repeat_rate
@@ -386,15 +634,57 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             tot_custs = int(cust_counts.nunique())
                             sku_repeat_rate = round((rep_custs / max(tot_custs, 1)) * 100, 2)
 
+                        if "customer_segments" not in new_state or not isinstance(new_state["customer_segments"], list):
+                            new_state["customer_segments"] = []
+                            
                         segment = next((s for s in new_state["customer_segments"] if s["name"].lower() == sku_name_str.lower()), None)
-                        if segment:
+                        
+                        # Calculate COD ratios
+                        cod_ratio = 50.0
+                        prepaid_ratio = 50.0
+                        if pm_col:
+                            cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum())
+                            placed_count = len(group)
+                            cod_ratio = round((cod_count / max(placed_count, 1)) * 100, 2)
+                            prepaid_ratio = 100 - cod_ratio
+
+                        # Calculate RTO rate from order status/delivery status
+                        rto_rate_on_delivered = round(cod_ratio * 0.38, 2)
+                        if delivered_col and rto_col:
+                            delivered_mask = group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"])
+                            rto_mask = group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"])
+                            total_del = int(delivered_mask.sum())
+                            total_r = int(rto_mask.sum())
+                            if total_del + total_r > 0:
+                                rto_rate_on_delivered = round((total_r / (total_del + total_r)) * 100, 2)
+
+                        product_name = sku_name_str
+                        if product_col and product_col in group.columns:
+                            product_values = group[product_col].dropna()
+                            if not product_values.empty:
+                                product_name = str(product_values.mode().iloc[0] if not product_values.mode().empty else product_values.iloc[0]).strip()
+
+                        if not segment:
+                            segment = {
+                                "segment_id": f"seg_{sku_name_str.lower().replace(' ', '_')}",
+                                "name": product_name,
+                                "prepaid_ratio": prepaid_ratio,
+                                "cod_ratio": cod_ratio,
+                                "repeat_rate": sku_repeat_rate,
+                                "return_rate": rto_rate_on_delivered,
+                                "rto_rate_on_delivered": rto_rate_on_delivered,
+                                "average_order_value": sku_aov,
+                                "skus": [sku_name_str]
+                            }
+                            new_state["customer_segments"].append(segment)
+                        else:
                             segment["average_order_value"] = sku_aov
                             segment["repeat_rate"] = sku_repeat_rate
-                            if pm_col:
-                                cod_count = int(group[pm_col].astype(str).str.upper().str.contains("COD|CASH").sum())
-                                placed_count = len(group)
-                                segment["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
-                                segment["prepaid_ratio"] = 100 - segment["cod_ratio"]
+                            segment["cod_ratio"] = cod_ratio
+                            segment["prepaid_ratio"] = prepaid_ratio
+                            segment["rto_rate_on_delivered"] = rto_rate_on_delivered
+                            segment["return_rate"] = rto_rate_on_delivered
+                            segment["name"] = product_name
 
                         for campaign in new_state.get("campaigns", []):
                             if sku_name_str.lower() in campaign["campaign_name"].lower() or campaign["campaign_name"].lower() in sku_name_str.lower():
@@ -404,10 +694,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 campaign["cod_ratio"] = round((cod_count / max(placed_count, 1)) * 100, 2)
                                 delivered_count = int(group[delivered_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "DELIVERED", "FULFILLED"]).sum()) if delivered_col else placed_count
                                 rto_count = int(group[rto_col].astype(str).str.upper().isin(["1", "TRUE", "YES", "RTO", "RETURNED", "UNDELIVERED"]).sum()) if rto_col else 0
+                                campaign["placed_orders_attributed"] = placed_count
                                 campaign["delivered_orders_attributed"] = delivered_count
                                 campaign["rto_count_attributed"] = rto_count
-                                if campaign["delivered_orders_attributed"] > 0:
-                                    campaign["rto_rate_attributed"] = round((campaign["rto_count_attributed"] / campaign["delivered_orders_attributed"]) * 100, 2)
+                                resolved_orders = campaign["delivered_orders_attributed"] + campaign["rto_count_attributed"]
+                                if resolved_orders > 0:
+                                    campaign["rto_rate_attributed"] = round((campaign["rto_count_attributed"] / resolved_orders) * 100, 2)
                                 
                                 print(f"   🛒 Shopify Orders matching campaign '{campaign['campaign_name']}': Total={placed_count}, COD Orders={cod_count} (COD Ratio={campaign['cod_ratio']}%) -> Realized Attributed RTO rate={campaign['rto_rate_attributed']}%", flush=True)
                                     
@@ -418,31 +710,6 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                     sku["projected_stockout_days"] = round(sku["inventory_left"] / sku["daily_velocity"], 1)
                 else:
                     sku["projected_stockout_days"] = 99.0
-                    
-            blended_aov = new_state.get("average_order_value") or 1500.0
-            for campaign in new_state.get("campaigns", []):
-                rto_pct = campaign.get("rto_rate_attributed", 0.0)
-                if rto_pct == 0.0:
-                    rto_pct = new_state.get("brand_rto_rate", 31.0)
-                    campaign["rto_rate_attributed"] = rto_pct
-                
-                campaign_skus = campaign.get("skus", [])
-                primary_sku = campaign_skus[0] if campaign_skus else ""
-                
-                sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == primary_sku.lower()), None)
-                sku_aov = sku_entity.get("average_order_value") if sku_entity else blended_aov
-                if not sku_aov:
-                    sku_aov = blended_aov
-                
-                cm_pre, rto_impact_factor, waste_mult = calculate_sku_margin_params_local(primary_sku or campaign.get("campaign_name", ""), sku_aov)
-                
-                campaign["roas_on_delivered_orders"] = round(campaign["roas_on_placed_orders"] * (1 - (rto_pct / 100)), 2)
-                campaign["contribution_margin_after_rto"] = max(int(cm_pre - (rto_pct * rto_impact_factor)), 5)
-                campaign["operational_waste_multiplier"] = waste_mult
-                campaign["placed_cac"] = round(sku_aov / max(campaign["roas_on_placed_orders"], 0.1), 2)
-                campaign["realized_cac"] = round(sku_aov / max(campaign["roas_on_delivered_orders"], 0.1), 2)
-                
-                print(f"   📈 Dynamic CM for '{campaign['campaign_name']}': ROAS On Placed orders {campaign['roas_on_placed_orders']}x compressed to ROAS On Delivered orders {campaign['roas_on_delivered_orders']}x. Margin compressed to {campaign['contribution_margin_after_rto']}% (using CM_pre={cm_pre}%, RTO_factor={rto_impact_factor}). Placed CAC = Rs {campaign['placed_cac']}, Realized CAC = Rs {campaign['realized_cac']}", flush=True)
                     
         else:
             # --- Backward compatible Single Sheet Ingestion ---
@@ -457,6 +724,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             freshness = DataFreshnessValidator.validate(df)
             
             if upload_source == "shopify_orders":
+                rto_col = next((c for c in df_canonical.columns if "rto" in c or "returned" in c or "undelivered" in c), None)
+                delivered_col = next((c for c in df_canonical.columns if "delivered" in c or "fulfilled" in c), None)
+                if rto_col is not None and delivered_col is not None and len(df_canonical) > 0:
+                    rto_data_present = True
+                    new_state["rto_status_source"] = f"shopify_orders.{rto_col}"
                 revenue_col = next((c for c in df_canonical.columns if c in {"revenue", "total", "amount", "price", "order_value"}), None)
                 blended_aov = 1500.0
                 if revenue_col and len(df_canonical) > 0:
@@ -620,6 +892,7 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 
                         roas = round(revenue_sum / max(spend, 1), 2) if revenue_sum > 0 else 3.0
                         rto_pct = round(cod_ratio * 0.4, 2)
+                        roas_src = "Shopify orders matching campaign name" if revenue_sum > 0 else "default baseline"
                         if not campaign:
                             campaign = {
                                 "campaign_id": camp_id_str,
@@ -627,12 +900,14 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                                 "spend": spend,
                                 "spend_growth_percent": 5.0,
                                 "roas_on_placed_orders": roas,
+                                "roas_source": roas_src,
                                 "roas_on_delivered_orders": roas,
                                 "frequency": 1.8,
                                 "ctr_drop_percent": 0.0,
                                 "ctr": 1.5,
                                 "cod_order_count": cod_count,
                                 "cod_ratio": cod_ratio,
+                                "placed_orders_attributed": placed_count,
                                 "rto_count_attributed": 0,
                                 "delivered_orders_attributed": placed_count,
                                 "rto_rate_attributed": rto_pct,
@@ -643,9 +918,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         else:
                             campaign["spend"] = spend
                             campaign["roas_on_placed_orders"] = roas
+                            campaign["roas_source"] = roas_src
                             campaign["cod_order_count"] = cod_count
                             campaign["cod_ratio"] = cod_ratio
                             campaign["rto_rate_attributed"] = rto_pct
+                            campaign["placed_orders_attributed"] = placed_count
                             
             elif upload_source == "meta_ads":
                 if "campaign_id" in df_canonical.columns:
@@ -715,6 +992,56 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             sku["projected_stockout_days"] = round(sku["inventory_left"] / sku["daily_velocity"], 1)
                         else:
                             sku["projected_stockout_days"] = 99.0
+
+        # Recalculate campaign level metrics (ROAS delivered, CAC, and CM after RTO) for all campaigns
+        blended_aov = new_state.get("average_order_value") or 1500.0
+        for campaign in new_state.get("campaigns", []):
+            rto_pct = campaign.get("rto_rate_attributed", 0.0)
+            if not rto_data_present:
+                rto_pct = 0.0
+                campaign["rto_rate_attributed"] = 0.0
+            else:
+                if rto_pct == 0.0:
+                    rto_pct = new_state.get("brand_rto_rate", 31.0)
+                    campaign["rto_rate_attributed"] = rto_pct
+            
+            campaign_skus = campaign.get("skus", [])
+            primary_sku = campaign_skus[0] if campaign_skus else ""
+            
+            sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == primary_sku.lower()), None)
+            sku_aov = sku_entity.get("average_order_value") if sku_entity else blended_aov
+            if not sku_aov:
+                sku_aov = blended_aov
+            
+            cm_pre, rto_impact_factor, waste_mult = calculate_sku_margin_params_local(primary_sku or campaign.get("campaign_name", ""), sku_aov)
+            
+            campaign["roas_on_delivered_orders"] = round(campaign["roas_on_placed_orders"] * (1 - (rto_pct / 100)), 2)
+            campaign["contribution_margin_after_rto"] = max(int(cm_pre - (rto_pct * rto_impact_factor)), 5)
+            campaign["operational_waste_multiplier"] = waste_mult
+            
+            # Recalculate CAC
+            placed_orders = campaign.get("placed_orders_attributed", 0)
+            delivered_orders = campaign.get("delivered_orders_attributed", 0)
+            spend = campaign.get("spend", 0)
+            
+            if spend > 0 and placed_orders > 0:
+                campaign["placed_cac"] = round(spend / placed_orders, 2)
+            else:
+                campaign["placed_cac"] = round(sku_aov / max(campaign["roas_on_placed_orders"], 0.1), 2)
+                
+            if spend > 0 and delivered_orders > 0:
+                campaign["realized_cac"] = round(spend / delivered_orders, 2)
+            else:
+                campaign["realized_cac"] = round(sku_aov / max(campaign["roas_on_delivered_orders"], 0.1), 2)
+            
+            # Default roas_source if not set
+            if "roas_source" not in campaign:
+                if campaign.get("roas_on_placed_orders", 0) > 0 and campaign.get("roas_on_placed_orders", 0) != 3.0:
+                    campaign["roas_source"] = "Meta Ads Manager ('meta_ads' sheet)"
+                else:
+                    campaign["roas_source"] = "default baseline"
+            
+            print(f"   📈 Dynamic CM for '{campaign['campaign_name']}': ROAS On Placed orders {campaign['roas_on_placed_orders']}x compressed to ROAS On Delivered orders {campaign['roas_on_delivered_orders']}x. Margin compressed to {campaign['contribution_margin_after_rto']}% (using CM_pre={cm_pre}%, RTO_factor={rto_impact_factor}). Placed CAC = Rs {campaign['placed_cac']}, Realized CAC = Rs {campaign['realized_cac']}", flush=True)
 
         # Build / Verify Brand record exists
         brand = db.get(Brand, brand_id)
@@ -791,6 +1118,14 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             else:
                 sku["spend_growth_percent"] = 0.0
 
+        if not rto_data_present:
+            rto_data_present, rto_status_source = workbook_has_rto_status_sheet(xls, sheet_names)
+            if rto_data_present and rto_status_source:
+                new_state["rto_status_source"] = rto_status_source
+                print(f"   ✅ RTO/delivery status source detected from workbook schema: {rto_status_source}", flush=True)
+
+        new_state["rto_data_present"] = rto_data_present
+        new_state = sanitize_json_value(new_state)
         self.update_state(state="PROGRESS", meta={"step": "Creating Business Snapshot"})
         
         # Save Business Snapshot record
@@ -881,6 +1216,9 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
         print("\n" + "=" * 80, flush=True)
         print(f"🎯 [DECISION PERSISTENCE] Successfully stored {decisions_created} decisions to PostgreSQL.", flush=True)
         print("=" * 80 + "\n", flush=True)
+
+        if previous_snapshot:
+            carry_forward_active_decisions(db, brand_id, previous_snapshot.id, snapshot.id)
 
         db.commit()
         
