@@ -3,10 +3,20 @@ from typing import Any
 import pandas as pd
 from datetime import datetime, timezone
 
+from .impact_math import (
+    compute_campaign_revenue_impact,
+    compute_inventory_revenue_impact,
+    compute_state_revenue_impact,
+    normalize_sku_metrics,
+    recovery_from_gap,
+    sample_size_confidence_cap,
+    state_operational_framing,
+)
+
 DEFAULT_AVERAGE_ORDER_VALUE = 500
 
 SIGNAL_THRESHOLDS = {
-    "InventoryRisk": {"projected_stockout_days_max": 7, "spend_growth_percent_min": 15, "severity": "high", "confidence": 0.82},
+    "InventoryRisk": {"projected_stockout_days_max": 7, "spend_growth_percent_min": 15, "severity": "high", "confidence": 0.75},
     "CreativeFatigue": {"frequency_min": 4, "ctr_drop_percent_min": 20, "ctr_max_without_baseline": 0.8, "severity": "medium", "confidence": 0.76},
     "MarginLeakage": {"cod_ratio_min": 60, "rto_rate_on_delivered_min": 18, "roas_on_placed_orders_min": 2.5, "severity": "high", "confidence": 0.85},
     "CampaignRTOSpike": {"rto_rate_attributed_min": 25, "cod_order_count_min": 50, "severity": "high", "confidence": 0.88},
@@ -20,11 +30,11 @@ SIGNAL_THRESHOLDS = {
         "confidence": 0.79,
     },
     "MarginTrap": {"placed_roas_min": 3.5, "delivered_roas_max": 3.0, "severity": "high", "confidence": 0.86},
-    "NewLaunchRisk": {"roas_max": 1.5, "frequency_max": 1.5, "severity": "medium", "confidence": 0.75},
+    "NewLaunchRisk": {"roas_max": 1.5, "frequency_max": 1.5, "severity": "medium", "confidence": 0.65},
     "AOVDilution": {"placed_roas_min": 3.0, "delivered_roas_max": 2.2, "severity": "medium", "confidence": 0.80},
-    "AudienceAudit": {"spend_min": 50000, "delivered_roas_max": 3.0, "placed_roas_min": 1.5, "severity": "high", "confidence": 0.89},
+    "AudienceAudit": {"spend_min": 50000, "delivered_roas_max": 3.0, "placed_roas_min": 1.5, "severity": "medium", "confidence": 0.82},
     "ConcentrationRisk": {"share_min": 0.20, "projected_stockout_days_max": 14, "rto_rate_on_delivered_min": 18, "severity": "high", "confidence": 0.90},
-    "StateRTOLeakage": {"rto_pct_min": 30, "total_orders_min": 10, "severity": "high", "confidence": 0.92},
+    "StateRTOLeakage": {"rto_pct_min": 30, "total_orders_min": 10, "severity": "medium", "confidence": 0.85},
     "CourierPerformanceWarning": {"rto_pct_min": 25, "total_orders_min": 10, "severity": "medium", "confidence": 0.84},
 }
 
@@ -298,9 +308,10 @@ class SignalDetectionEngine:
 
         # --- RULE EVALUATION ---
         for sku in skus:
+            sku = normalize_sku_metrics(sku)
             thresholds = SIGNAL_THRESHOLDS["InventoryRisk"]
             projected = sku["projected_stockout_days"]
-            spend_growth = sku["spend_growth_percent"]
+            spend_growth = float(sku.get("spend_growth_percent", 0) or 0)
             
             is_cliff = projected <= 3.0
             is_growth_risk = projected <= thresholds["projected_stockout_days_max"] and spend_growth >= thresholds["spend_growth_percent_min"]
@@ -308,26 +319,56 @@ class SignalDetectionEngine:
             if is_cliff or is_growth_risk:
                 base_conf = thresholds["confidence"]
                 conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
+                conf_expl += " Inbound PO and supplier ETA data are unavailable; confidence capped until restock visibility improves."
                 
-                sku_aov = sku.get("average_order_value") or average_order_value
-                daily_revenue = sku["daily_velocity"] * sku_aov
+                sku_aov = sku.get("average_order_value")
+                if not sku_aov or float(sku_aov) == 0.0:
+                    sku_name = sku.get("name")
+                    if sku_name:
+                        same_name_skus = [
+                            s for s in skus
+                            if s.get("name", "").strip().lower() == sku_name.strip().lower()
+                            and s.get("average_order_value")
+                            and float(s["average_order_value"]) > 0.0
+                        ]
+                        if same_name_skus:
+                            sku_aov = sum(float(s["average_order_value"]) for s in same_name_skus) / len(same_name_skus)
+                if not sku_aov or float(sku_aov) == 0.0:
+                    sku_aov = average_order_value
+                
+                impact_metrics = compute_inventory_revenue_impact(
+                    sku["daily_velocity"],
+                    float(sku_aov),
+                    projected,
+                )
+                revenue_at_risk = impact_metrics["at_risk_revenue"]
+                out_of_stock_days = impact_metrics["stockout_days_in_window"]
                 
                 is_out_of_stock = projected <= 0.0
                 if is_out_of_stock:
-                    out_of_stock_days = 7.0
-                    revenue_at_risk = round(daily_revenue * out_of_stock_days)
                     title_prefix = "Active Stockout Alert"
-                    explanation = f"SKU {sku['name']} is completely out of stock, driving immediate revenue loss and marketing inefficiency."
-                    impact_label = f"Rs {revenue_at_risk:,.0f} revenue loss over next 7 days (Stockout)"
-                else:
-                    out_of_stock_days = round(max(0.1, 7.0 - projected), 1)
-                    revenue_at_risk = round(daily_revenue * out_of_stock_days)
-                    title_prefix = "Critical Inventory Cliff" if is_cliff else "Critical Stockout Threat"
                     explanation = (
-                        f"Inventory cover is critically depleted ({projected} days remaining), presenting an immediate stockout risk."
-                        if is_cliff else "Spend is accelerating while SKU inventory is below one week of cover."
+                        f"{sku['name']} is out of stock based on current on-hand inventory and recent sales velocity. "
+                        "Without confirmed inbound inventory, revenue realization is constrained until restock arrives."
                     )
-                    impact_label = f"Rs {revenue_at_risk:,.0f} revenue at risk over next 7 days ({out_of_stock_days} days stockout)"
+                    impact_label = f"Rs {revenue_at_risk:,.0f} forecasted lost sales over next 7 days"
+                else:
+                    title_prefix = "Critical Inventory Cliff" if is_cliff else "Critical Stockout Threat"
+                    if spend_growth >= thresholds["spend_growth_percent_min"]:
+                        explanation = (
+                            f"{sku['name']} has approximately {projected} day(s) of inventory cover remaining while ad spend "
+                            f"accelerated {spend_growth:.1f}% week over week. Stockout risk is elevated without confirmed inbound inventory."
+                        )
+                    else:
+                        explanation = (
+                            f"{sku['name']} has approximately {projected} day(s) of inventory cover remaining based on recent "
+                            "sales velocity. Without confirmed inbound inventory, stockout risk is elevated. Revenue realization may be "
+                            "constrained if demand continues at current levels."
+                        )
+                    impact_label = (
+                        f"Rs {revenue_at_risk:,.0f} forecasted lost sales over next 7 days "
+                        f"({out_of_stock_days} days stockout within forecast window)"
+                    )
                 
                 severity = "high" if (is_cliff or is_out_of_stock) else thresholds["severity"]
                 rule = "projected_stockout_days <= 3.0" if (is_cliff or is_out_of_stock) else "projected_stockout_days <= 7 AND spend_growth_percent >= 15"
@@ -341,24 +382,28 @@ class SignalDetectionEngine:
                         confidence_score=conf_score,
                         business_impact=revenue_at_risk,
                         impact_label=impact_label,
-                        recommendation="Reorder immediately OR pause scaling campaigns to prevent traffic redirection to out-of-stock product.",
+                        recommendation="Submit a priority restock order immediately. Reduce prospecting spend until inbound inventory is confirmed.",
                         affected_campaigns=sku.get("campaigns", []),
                         affected_skus=[sku["name"]],
                         rule=rule,
                         explanation=explanation,
                         cross_system_signals=[
-                            f"SKU velocity is {sku['daily_velocity']} units/day",
-                            f"Inventory left is {sku['inventory_left']} units",
-                            f"Projected stockout is {projected} days",
-                            f"Ad spend grew {spend_growth}% week over week",
-                            f"SKU-level AOV is Rs {sku_aov:,.2f}"
+                            f"Inventory left: {sku['inventory_left']} units",
+                            f"Daily velocity: {sku['daily_velocity']} units/day",
+                            f"Inventory cover: {projected} days",
+                            f"Spend growth: {spend_growth:.1f}%",
+                            f"SKU-level AOV: Rs {sku_aov:,.2f}",
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": "Inventory cover falls further"},
                             {"horizon": "48 hr", "impact": "Reorder window becomes operationally tight"},
                             {"horizon": "72 hr", "impact": "Paid traffic drives demand into hard stockout"}
                         ],
-                        recommended_actions=["Create reorder today", "Reduce prospecting spend by 15%", "Keep prepaid retargeting live"],
+                        recommended_actions=[
+                            f"Submit priority restock for {sku['name']}",
+                            "Reduce prospecting spend by 15%",
+                            "Pause ads on out-of-stock risk SKUs",
+                        ],
                         verification_signals=[
                             {
                                 "label": "Inventory reorder verification",
@@ -592,37 +637,61 @@ class SignalDetectionEngine:
             # --- NEW LAUNCH RISK (EC3) ---
             launch = SIGNAL_THRESHOLDS["NewLaunchRisk"]
             placed_roas = campaign.get("roas_on_placed_orders", 0.0)
+            delivered_roas = campaign.get("roas_on_delivered_orders", 0.0)
             freq = campaign.get("frequency", 0.0)
             spend = campaign.get("spend", 0.0)
             if spend > 0 and placed_roas < launch["roas_max"] and freq <= launch["frequency_max"]:
+                impact = compute_campaign_revenue_impact(spend, placed_roas, delivered_roas)
+                revenue_gap = impact["revenue_gap"]
+                placed_revenue = impact["placed_revenue"]
+                delivered_revenue = impact["delivered_revenue"]
+                impact_pct = impact["impact_percent"]
+
                 base_conf = launch["confidence"]
-                conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
-                
+                if freq <= 1.3:
+                    base_conf *= 0.9
+                if not rto_data_present:
+                    base_conf *= 0.88
+                conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=False)
+                conf_expl += " Low-frequency launch still in learning phase; confidence capped until more delivery data is available."
+
                 signals.append(
                     Signal(
                         title=f"New Launch Risk on {campaign['campaign_name']}",
                         signal_type="NewLaunchRisk",
-                        issue_type="Creative fatigue",
+                        issue_type="Launch validation",
                         severity=launch["severity"],
                         confidence_score=conf_score,
-                        business_impact=round(spend),
-                        impact_label=f"Rs {spend:,.0f} launch spend at risk",
-                        recommendation="Early launch performance is weak. Pivot creatives immediately or re-verify targeting options.",
+                        business_impact=revenue_gap if revenue_gap > 0 else None,
+                        impact_label=f"Rs {revenue_gap:,.0f} estimated revenue gap ({impact_pct:.1f}% of placed revenue)",
+                        recommendation="Hold spend steady while collecting more delivery data. Review targeting and offer fit before pausing or refreshing creatives.",
                         affected_campaigns=[campaign["campaign_name"]],
                         affected_skus=campaign.get("skus", []),
                         rule="roas < 1.5 AND frequency <= 1.5 AND daily_spend > 0",
-                        explanation="Newly launched ad set exhibits extremely low ROAS with low frequency exposure.",
+                        explanation=(
+                            "Newly launched ad set is currently performing below target ROAS while remaining in a low-frequency learning phase. "
+                            "Additional delivery data is required before determining whether underperformance is driven by creative, audience, "
+                            "offer, or landing-page factors."
+                        ),
                         cross_system_signals=[
-                            f"Early ROAS is {placed_roas}x",
-                            f"Ad frequency is {freq}",
-                            f"Early test spend is Rs {spend:,.0f}"
+                            f"Campaign spend: Rs {spend:,.0f}",
+                            f"Placed revenue: Rs {placed_revenue:,.0f}",
+                            f"Estimated delivered revenue: Rs {delivered_revenue:,.0f}",
+                            f"Estimated revenue gap: Rs {revenue_gap:,.0f}",
+                            f"Placed ROAS: {round(placed_roas, 2)}x",
+                            f"Estimated delivered ROAS: {round(delivered_roas, 2)}x",
+                            f"Ad frequency: {round(freq, 2)}",
                         ],
                         risk_projection=[
-                            {"horizon": "24 hr", "impact": "Inefficient launch spend continues"},
-                            {"horizon": "48 hr", "impact": "Algorithmic learning cost climbs"},
-                            {"horizon": "72 hr", "impact": "Launch fails to establish profitable baseline"}
+                            {"horizon": "24 hr", "impact": "Launch spend continues before learning stabilizes"},
+                            {"horizon": "48 hr", "impact": "Revenue gap may widen if ROAS does not improve"},
+                            {"horizon": "72 hr", "impact": "Launch may fail to establish profitable baseline"}
                         ],
-                        recommended_actions=["Test three new ad copies", "Optimize landing page conversion", "Pause high-CPC ad sets"],
+                        recommended_actions=[
+                            "Collect more delivery data before major creative changes",
+                            "Review audience targeting and offer-page conversion",
+                            "Cap spend until frequency exceeds 1.5 and ROAS stabilizes",
+                        ],
                         verification_signals=[],
                         confidence_explanation=conf_expl,
                         relationship_edges=OntologyLayer.build_relationships("NewLaunchRisk", [campaign["campaign_name"]], campaign)
@@ -796,45 +865,64 @@ class SignalDetectionEngine:
                 audit = SIGNAL_THRESHOLDS["AudienceAudit"]
                 
                 if spend >= audit["spend_min"] and delivered <= audit["delivered_roas_max"] and placed >= audit["placed_roas_min"]:
+                    campaign_rto_verified = bool(
+                        campaign.get("rto_count_attributed", 0) > 0 or campaign.get("delivered_orders_attributed", 0) > 0
+                    )
                     base_conf = audit["confidence"]
-                    conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
-                    
-                    # Calculate lifetime Revenue Gap due to RTO/cancellations
-                    loss = round(spend * (placed - delivered))
+                    conf_score, conf_expl = ConfidenceEngine.calculate(
+                        base_conf,
+                        freshness,
+                        alignment_confirmed=campaign_rto_verified,
+                    )
+                    if not campaign_rto_verified:
+                        conf_score = round(min(conf_score, 0.78), 2)
+                        conf_expl += " Campaign-level RTO is estimated from brand-level fallback — confidence capped at 78%."
+
+                    impact_metrics = compute_campaign_revenue_impact(spend, placed, delivered)
+                    loss = impact_metrics["revenue_gap"]
                     loss = max(loss, 5000)
-                    
-                    # Read the attributed RTO rate from tasks.py
+
                     attr_rto = campaign.get("rto_rate_on_delivered", campaign.get("rto_rate_attributed", 0.0))
-                    
+
                     signals.append(
                         Signal(
-                            title=f"Strategic Audit: High-spend Audience Testing campaign {c_name} has low delivered ROAS",
+                            title=f"Fulfillment Gap: {c_name} placed ROAS strong, delivered realization weak",
                             signal_type="AudienceAudit",
                             issue_type="Marketing pressure",
                             severity=audit["severity"],
                             confidence_score=conf_score,
                             business_impact=loss,
-                            impact_label=f"Rs {loss:,.0f} unrealized revenue from RTO/cancellations",
-                            recommendation="Audit or pause this campaign. Narrow targeting to prepaid-only audiences or add COD verification.",
+                            impact_label=f"Rs {loss:,.0f} estimated revenue gap from fulfillment realization",
+                            recommendation=(
+                                "Segment campaign by COD vs prepaid. Enable COD verification. Review high-RTO geographies. "
+                                "Reduce spend escalation until delivered performance improves. "
+                                "Pause only if delivered ROAS remains below threshold after verification."
+                            ),
                             affected_campaigns=[c_name],
                             affected_skus=campaign.get("skus", []),
                             rule="spend >= 50000 AND delivered_roas <= 3.0 AND placed_roas >= 1.5",
-                            explanation="Testing campaign spend produces sub-optimal returns due to high return-to-origin (RTO) or cancellation rates on paper.",
+                            explanation=(
+                                f"Campaign placed ROAS is {placed}x with Rs {spend:,.0f} spend, but delivered ROAS is only {delivered}x. "
+                                f"The gap reflects fulfillment realization (RTO/cancellations), not weak demand."
+                            ),
                             cross_system_signals=[
                                 f"Campaign spend is Rs {spend:,.2f}",
                                 f"Placed ROAS is {placed}x",
                                 f"Realized Delivered ROAS is {delivered}x",
-                                f"Attributed RTO rate is {attr_rto}%"
+                                f"Attributed RTO rate is {attr_rto}%",
+                                f"Placed revenue is Rs {impact_metrics['placed_revenue']:,.0f}",
+                                f"Estimated delivered revenue is Rs {impact_metrics['delivered_revenue']:,.0f}",
+                                f"Estimated revenue gap is Rs {loss:,.0f}",
                             ],
                             risk_projection=[
-                                {"horizon": "24 hr", "impact": "Spend on unprofitable cold traffic continues"},
-                                {"horizon": "48 hr", "impact": "High volume of cash returns accumulate in transit"},
-                                {"horizon": "72 hr", "impact": "Erosive return logistics fees compress net profits"}
+                                {"horizon": "24 hr", "impact": "Fulfillment gap continues to mask true campaign profitability"},
+                                {"horizon": "48 hr", "impact": "Returns accumulate while placed metrics look healthy"},
+                                {"horizon": "72 hr", "impact": "Spend escalation amplifies unrealized revenue gap"}
                             ],
                             recommended_actions=[
-                                "Pause underperforming ad sets in this campaign",
-                                "Target prepaid/UPI payment methods only",
-                                "Trigger automatic WhatsApp COD confirmation"
+                                "Segment campaign performance by COD vs prepaid",
+                                "Enable COD verification before dispatch",
+                                "Review high-RTO geographies before pausing",
                             ],
                             verification_signals=[],
                             confidence_explanation=conf_expl,
@@ -915,31 +1003,78 @@ class SignalDetectionEngine:
             cod_p = st["cod_pct"]
             
             if tot_ord >= state_thresholds["total_orders_min"] and rto_p >= state_thresholds["rto_pct_min"]:
-                base_conf = state_thresholds["confidence"]
-                conf_score, conf_expl = ConfidenceEngine.calculate(base_conf, freshness, alignment_confirmed=True)
-                
-                rto_count = round(tot_ord * (rto_p / 100))
-                loss = rto_count * 150
-                
+                brand_rto = float(state.get("brand_rto_rate", 0) or 0)
+                sample_cap = sample_size_confidence_cap(tot_ord)
+                conf_score, conf_expl = ConfidenceEngine.calculate(
+                    state_thresholds["confidence"],
+                    freshness,
+                    alignment_confirmed=tot_ord >= 50,
+                )
+                conf_score = round(min(conf_score, sample_cap), 2)
+                conf_expl += (
+                    f" Only {tot_ord} orders in {s_name} — a single status change can swing RTO by ~8+ points. "
+                    f"Confidence capped at {int(sample_cap * 100)}% for this sample size."
+                )
+
+                impact_metrics = compute_state_revenue_impact(
+                    tot_ord,
+                    rto_p,
+                    total_revenue=float(st.get("total_revenue", 0) or 0),
+                    rto_revenue=float(st.get("rto_revenue", 0) or 0),
+                    delivered_revenue=float(st.get("delivered_revenue", 0) or 0),
+                )
+                rto_count = impact_metrics["rto_count"]
+                loss = impact_metrics["at_risk_revenue"]
+                shipping_waste = impact_metrics["shipping_waste"]
+                rto_delta = round(rto_p - brand_rto, 1) if brand_rto else None
+                delta_abs = abs(rto_delta or 0)
+                cod_dominant = cod_p >= 70
+                monitor_case = delta_abs <= 5 and cod_dominant
+
+                if monitor_case:
+                    title = f"Regional COD Risk: {s_name}"
+                    severity = "low"
+                    explanation = (
+                        f"{s_name} runs {cod_p}% COD across {tot_ord} orders. Regional RTO is {rto_p}% — only "
+                        f"{rto_delta:+.1f} pts vs brand average ({brand_rto}%). "
+                        f"The signal reflects COD concentration and sample size, not a uniquely poor state return profile."
+                    )
+                    recommendation = (
+                        f"Monitor {s_name} COD mix and test prepaid incentives before restricting regional shipping."
+                    )
+                else:
+                    title = f"State Profitability Leakage: High RTO in {s_name}"
+                    severity = "medium" if loss < 5000 else state_thresholds["severity"]
+                    explanation = (
+                        f"Orders from {s_name} favor COD ({cod_p}%) with RTO at {rto_p}% — "
+                        f"{rto_delta:+.1f} pts vs brand average ({brand_rto}%), indicating regional margin pressure."
+                    )
+                    recommendation = f"Exclude {s_name} from COD shipping or run prepaid-only promotions for this region."
+
                 signals.append(
                     Signal(
-                        title=f"State Profitability Leakage: High RTO in {s_name}",
+                        title=title,
                         signal_type="StateRTOLeakage",
-                        issue_type="Margin leakage",
-                        severity=state_thresholds["severity"],
+                        issue_type="State RTO leakage",
+                        severity=severity,
                         confidence_score=conf_score,
-                        business_impact=loss,
-                        impact_label=f"Rs {loss:,.0f} return shipping waste in {s_name}",
-                        recommendation=f"Exclude {s_name} from COD shipping or run prepaid-only promotions for this region.",
+                        business_impact=loss if loss > 0 else None,
+                        impact_label=f"Rs {loss:,.0f} RTO order GMV at risk in {s_name}",
+                        recommendation=recommendation,
                         affected_campaigns=[],
                         affected_skus=[],
                         rule="state_orders >= 10 AND state_rto_rate >= 30%",
-                        explanation=f"Orders from {s_name} favor COD ({cod_p}%), triggering a high RTO rate of {rto_p}%, eroding margins.",
+                        explanation=explanation,
                         cross_system_signals=[
                             f"State: {s_name}",
                             f"Total orders: {tot_ord}",
                             f"COD mix: {cod_p}%",
-                            f"RTO rate: {rto_p}%"
+                            f"RTO rate: {rto_p}%",
+                            f"Brand average RTO: {brand_rto}%",
+                            *( [f"State RTO delta: {rto_delta:+.1f}%"] if rto_delta is not None else [] ),
+                            f"Regional order GMV: Rs {impact_metrics['total_revenue']:,.0f}",
+                            f"RTO order GMV: Rs {loss:,.0f}",
+                            f"Estimated shipping waste: Rs {shipping_waste:,.0f}",
                         ],
                         risk_projection=[
                             {"horizon": "24 hr", "impact": f"Additional shipping loss in {s_name}"},

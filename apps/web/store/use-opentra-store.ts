@@ -2,7 +2,8 @@
 
 import { create } from "zustand";
 import { operationalState } from "@/lib/demo-data";
-import { Decision, DecisionState, OperationalState, TimelineEvent, UploadSource, MappingSuggestion } from "@/lib/types";
+import { enrichDecisionClient } from "@/lib/decision-v2";
+import { Decision, DecisionState, OperationalState, RemedyAction, TimelineEvent, UploadSource, MappingSuggestion } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const RESET_TOKEN = process.env.NEXT_PUBLIC_RESET_TOKEN || "opentra";
@@ -25,6 +26,7 @@ interface OpentraStore extends OperationalState {
   setBrandId: (id: string) => void;
   setMappingOpen: (open: boolean) => void;
   updateDecisionState: (id: string, state: DecisionState) => void;
+  selectRemedy: (id: string, remedy: RemedyAction) => void;
   selectedDecision: () => Decision | undefined;
   
   // Asynchronous API Actions
@@ -36,10 +38,13 @@ interface OpentraStore extends OperationalState {
   resetDatabase: () => Promise<void>;
 }
 
-function actionEvent(state: DecisionState): TimelineEvent {
+function actionEvent(state: DecisionState, extra?: string): TimelineEvent {
   const copy: Record<DecisionState, string> = {
     pending: "Returned to pending",
-    monitoring: "User clicked Take Action",
+    acknowledged: "Operator acknowledged decision",
+    action_planned: "Action planned",
+    action_executed: "Action executed",
+    monitoring: "Monitoring started",
     verified: "Execution verified",
     successful: "Marked successful",
     unsuccessful: "Marked unsuccessful",
@@ -47,13 +52,24 @@ function actionEvent(state: DecisionState): TimelineEvent {
     snoozed: "User snoozed decision"
   };
 
+  const descriptions: Partial<Record<DecisionState, string>> = {
+    monitoring: "Monitoring started. The next upload will verify downstream operational change.",
+    action_planned: extra || "Operator selected a remedy.",
+    action_executed: "Operational change deployed in connected systems.",
+    acknowledged: "Decision reviewed and ready for remedy selection."
+  };
+
   return {
     id: `evt_${state}_${Date.now()}`,
     time: "Now",
     title: copy[state],
-    description: state === "monitoring" ? "Monitoring started. The next upload will verify downstream operational change." : "Decision state updated.",
-    kind: state === "monitoring" ? "human" : "system"
+    description: descriptions[state] || "Decision state updated.",
+    kind: ["monitoring", "action_planned", "action_executed", "acknowledged", "ignored", "snoozed"].includes(state) ? "human" : "system"
   };
+}
+
+function enrichDecisions(decisions: Decision[], campaigns: OperationalState["campaigns"], skus: OperationalState["skus"]) {
+  return decisions.map((decision) => enrichDecisionClient(decision, campaigns, skus));
 }
 
 export const useOpentraStore = create<OpentraStore>((set, get) => ({
@@ -85,25 +101,54 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
   setMappingOpen: (open) => set({ mappingOpen: open }),
   
   updateDecisionState: (id, state) => {
-    // Optimistically update locally
     set((current) => ({
-      decisions: current.decisions.map((decision) =>
-        decision.id === id
-          ? {
-              ...decision,
-              state,
-              timeline: [...decision.timeline, actionEvent(state)]
-            }
-          : decision
+      decisions: enrichDecisions(
+        current.decisions.map((decision) =>
+          decision.id === id
+            ? {
+                ...decision,
+                state,
+                lifecycleLabel: state,
+                timeline: [...decision.timeline, actionEvent(state)]
+              }
+            : decision
+        ),
+        current.campaigns,
+        current.skus
       )
     }));
 
-    // Perform API call to sync state
     fetch(`${API_URL}/decisions/${id}/state`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ state })
     }).catch((err) => console.error("Failed to sync state to backend:", err));
+  },
+
+  selectRemedy: (id, remedy) => {
+    set((current) => ({
+      decisions: enrichDecisions(
+        current.decisions.map((decision) =>
+          decision.id === id
+            ? {
+                ...decision,
+                state: "action_planned",
+                selectedRemedyId: remedy.id,
+                lifecycleLabel: "action_planned",
+                timeline: [...decision.timeline, actionEvent("action_planned", `Selected: ${remedy.label}`)]
+              }
+            : decision
+        ),
+        current.campaigns,
+        current.skus
+      )
+    }));
+
+    fetch(`${API_URL}/decisions/${id}/remedy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remedy_id: remedy.id, remedy_label: remedy.label })
+    }).catch((err) => console.error("Failed to sync remedy to backend:", err));
   },
   
   selectedDecision: () => get().decisions.find((decision) => decision.id === get().selectedDecisionId) || undefined,
@@ -124,7 +169,7 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
         campaigns: data.campaigns,
         customerSegments: data.customerSegments,
         creatives: data.creatives,
-        decisions: data.decisions,
+        decisions: enrichDecisions(data.decisions || [], data.campaigns || [], data.skus || []),
         loading: false
       });
       if (data.decisions && data.decisions.length > 0) {

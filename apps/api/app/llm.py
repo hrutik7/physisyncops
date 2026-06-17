@@ -10,10 +10,9 @@ class LLMEnrichmentService:
     def enrich_signal(signal: Signal) -> dict[str, Any]:
         """
         Enriches a mathematically detected signal with deep e-commerce strategic narrative.
-        Queries live LLM (Gemini or OpenAI) if configured; otherwise gracefully falls back
+        Queries live OpenAI if configured; otherwise gracefully falls back
         to a highly specific e-commerce domain mockup.
         """
-        gemini_key = os.getenv("GEMINI_API_KEY")
         openai_key = os.getenv("OPENAI_API_KEY")
         
         # Build prompt that forces structured JSON output
@@ -55,13 +54,7 @@ class LLMEnrichmentService:
         Do NOT wrap the output in markdown code blocks like ```json ... ```. Output raw JSON ONLY.
         """
 
-        if gemini_key:
-            print(f"🔮 [LLM LAYER] Live query routed to Google Gemini...", flush=True)
-            result = LLMEnrichmentService._query_gemini(prompt, gemini_key)
-            if result:
-                return result
-                
-        elif openai_key:
+        if openai_key:
             print(f"🔮 [LLM LAYER] Live query routed to OpenAI...", flush=True)
             result = LLMEnrichmentService._query_openai(prompt, openai_key)
             if result:
@@ -70,34 +63,6 @@ class LLMEnrichmentService:
         # Graceful fallback logic (acts as a premium mock generator)
         print(f"🔮 [LLM LAYER] Running offline mock fallback enrichment for {signal.signal_type}...", flush=True)
         return LLMEnrichmentService._generate_fallback(signal)
-
-    @staticmethod
-    def _query_gemini(prompt: str, api_key: str) -> dict[str, Any] | None:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-        data = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.3
-            }
-        }
-        
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(data).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                res_body = json.loads(response.read().decode("utf-8"))
-                text_content = res_body["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text_content.strip())
-        except Exception as e:
-            print(f"⚠️ [LLM LAYER] Gemini API call failed: {e}. Falling back...", flush=True)
-            return None
 
     @staticmethod
     def _query_openai(prompt: str, api_key: str) -> dict[str, Any] | None:
@@ -122,7 +87,7 @@ class LLMEnrichmentService:
                 },
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 res_body = json.loads(response.read().decode("utf-8"))
                 text_content = res_body["choices"][0]["message"]["content"]
                 return json.loads(text_content.strip())
@@ -137,34 +102,41 @@ class LLMEnrichmentService:
         campaign = signal.affected_campaigns[0] if signal.affected_campaigns else "Marketing campaigns"
         
         if signal.signal_type == "InventoryRisk":
+            spend_signal = next((s for s in signal.cross_system_signals if "spend growth" in s.lower()), "")
+            spend_growth = 0.0
+            if spend_signal and ":" in spend_signal:
+                try:
+                    spend_growth = float(spend_signal.split(":", 1)[1].strip().replace("%", ""))
+                except ValueError:
+                    spend_growth = 0.0
+            cover_signal = next((s for s in signal.cross_system_signals if "inventory cover" in s.lower()), "")
+            cover_days = "limited"
+            if cover_signal and ":" in cover_signal:
+                cover_days = cover_signal.split(":", 1)[1].strip().replace("days", "").strip()
+            if spend_growth >= 15:
+                explanation = (
+                    f"{sku} has approximately {cover_days} day(s) of inventory cover remaining while ad spend "
+                    f"accelerated {spend_growth:.1f}% week over week. Stockout risk is elevated without confirmed inbound inventory."
+                )
+            else:
+                explanation = (
+                    f"{sku} has approximately {cover_days} day(s) of inventory cover remaining based on recent sales velocity. "
+                    "Without confirmed inbound inventory, stockout risk is elevated. Revenue realization may be constrained "
+                    "if demand continues at current levels."
+                )
             return {
-                "title": f"Critical Stockout Threat: {sku} inventory cover under 7 days",
-                "explanation": (
-                    f"Rapid sales acceleration driven by scaling ad campaigns has depleted cover "
-                    f"for {sku} to an operationally dangerous level. Continuing at this pace will lead "
-                    f"to active ad traffic driving customer click demand directly into a hard stockout, "
-                    f"resulting in wasted marketing ad spend and loss of key search velocity."
+                "title": signal.title,
+                "explanation": explanation,
+                "recommendation": (
+                    "Submit a priority restock order immediately. Reduce prospecting spend until inbound inventory is confirmed."
                 ),
-                "recommendation": f"Immediately slow down prospecting campaigns driving {sku} or submit a priority restock order within 48 hours.",
                 "confidence_explanation": (
-                    f"Heuristic is highly aligned: current stock is low, and spend growth is verified at "
-                    f"over 15% week-over-week across matching Meta prospecting campaigns."
+                    "Inventory and velocity are verified from the latest upload, but open POs, supplier lead times, "
+                    "and inbound shipment ETAs are unavailable — confidence is capped until restock visibility improves."
                 ),
-                "recommended_actions": [
-                    f"Submit prioritized reorder to factory for {sku}",
-                    "Temporarily decrease prospecting ad budgets by 15% on flagged campaigns",
-                    "Transition remaining ad budgets to higher-margin prepaid retargeting lists"
-                ],
-                "risk_projection": [
-                    {"horizon": "24 hr", "impact": "Inventory reserves fall further; operational handling window shrinks"},
-                    {"horizon": "48 hr", "impact": "Standard restock options expire; expedited shipping costs apply"},
-                    {"horizon": "72 hr", "impact": "Complete stockout occurs; ad spend wasted on out-of-stock variations"}
-                ],
-                "relationship_edges": [
-                    {"from": campaign, "to": f"{sku} Sales", "label": "accelerates demand", "strength": "strong"},
-                    {"from": f"{sku} Sales", "to": "Inventory Levels", "label": "erodes stock cover", "strength": "strong"},
-                    {"from": "Inventory Levels", "to": "Ad Efficiency", "label": "threatens complete stockout", "strength": "strong"}
-                ]
+                "recommended_actions": signal.recommended_actions,
+                "risk_projection": signal.risk_projection,
+                "relationship_edges": signal.relationship_edges,
             }
             
         elif signal.signal_type == "CampaignRTOSpike":
@@ -228,6 +200,73 @@ class LLMEnrichmentService:
                 ]
             }
             
+        elif signal.signal_type == "NewLaunchRisk":
+            freq_signal = next((s for s in signal.cross_system_signals if "frequency" in s.lower()), "")
+            spend_signal = next((s for s in signal.cross_system_signals if "spend" in s.lower()), "")
+            return {
+                "title": signal.title,
+                "explanation": (
+                    "Newly launched ad set is currently performing below target ROAS while remaining in a low-frequency learning phase. "
+                    "Additional delivery data is required before determining whether underperformance is driven by creative, audience, "
+                    "offer, or landing-page factors."
+                ),
+                "recommendation": (
+                    "Early launch performance is below target. Continue gathering delivery data while reviewing creatives, "
+                    "offer positioning, and audience targeting. Limit spend escalation until ROAS stabilizes."
+                ),
+                "confidence_explanation": (
+                    "Launch rule inputs are verified from Meta spend and placed ROAS, but campaign-level delivery attribution "
+                    "and historical baseline comparisons are incomplete. Confidence is capped until more delivery data is collected."
+                ),
+                "recommended_actions": [
+                    "Collect more delivery data before major creative changes",
+                    "Review audience targeting and offer-page conversion",
+                    "Cap spend until frequency exceeds 1.5 and ROAS stabilizes",
+                ],
+                "risk_projection": signal.risk_projection,
+                "relationship_edges": signal.relationship_edges,
+            }
+
+        elif signal.signal_type == "StateRTOLeakage":
+            state_name = signal.cross_system_signals[0].split(":", 1)[1].strip() if signal.cross_system_signals else "the flagged state"
+            orders_signal = next((s for s in signal.cross_system_signals if "Total orders" in s), "")
+            brand_rto_signal = next((s for s in signal.cross_system_signals if "Brand average RTO" in s), "")
+            cod_signal = next((s for s in signal.cross_system_signals if "COD mix" in s), "")
+            delta_signal = next((s for s in signal.cross_system_signals if "State RTO delta" in s), "")
+            monitor_case = "Regional COD Risk" in signal.title
+            return {
+                "title": signal.title,
+                "explanation": signal.explanation,
+                "recommendation": signal.recommendation if not monitor_case else (
+                    f"Monitor {state_name} COD dependence ({cod_signal.split(':', 1)[1].strip() if cod_signal else 'high COD'}). "
+                    f"Test prepaid incentives before restricting shipping — regional RTO ({delta_signal.split(':', 1)[1].strip() if delta_signal else 'near brand average'}) "
+                    "does not yet prove a uniquely poor state profile."
+                ),
+                "confidence_explanation": (
+                    f"{orders_signal or 'Limited order volume'} in this state means the regional RTO rate can swing sharply "
+                    f"with a few delivery-status changes. {brand_rto_signal or 'Brand benchmark'} provides comparison context, "
+                    "but confidence remains capped until sample size grows."
+                ),
+                "recommended_actions": signal.recommended_actions,
+                "risk_projection": signal.risk_projection,
+                "relationship_edges": signal.relationship_edges,
+            }
+
+        elif signal.signal_type == "AudienceAudit":
+            campaign = signal.affected_campaigns[0] if signal.affected_campaigns else "flagged campaign"
+            return {
+                "title": signal.title,
+                "explanation": signal.explanation,
+                "recommendation": signal.recommendation,
+                "confidence_explanation": (
+                    "Spend and placed ROAS are verified from Meta, but delivered revenue and campaign RTO rely on "
+                    "brand-level fallback until campaign mapping completes — confidence is capped accordingly."
+                ),
+                "recommended_actions": signal.recommended_actions,
+                "risk_projection": signal.risk_projection,
+                "relationship_edges": signal.relationship_edges,
+            }
+
         elif signal.signal_type == "MarginLeakage":
             return {
                 "title": f"Margin Alert: COD leakage on {sku}",

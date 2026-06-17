@@ -59,6 +59,8 @@ def calculate_sku_margin_params(db, brand_id: str, sku_name_or_id: str, sku_aov:
         return econ
 
     econ = get_sku_economics(sku_name_or_id)
+    if econ and econ.average_order_value and econ.average_order_value > 0.0:
+        sku_aov = econ.average_order_value
     sku_aov = max(sku_aov or 500.0, 1.0)
     if econ and (econ.shipping_cost > 0 or econ.rto_cost > 0 or econ.packaging_cost > 0):
         shipping = econ.shipping_cost
@@ -569,16 +571,24 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                             rto_pct = round((rto_cnt / tot_ord) * 100, 2)
                             
                             deliv_rev = 0.0
+                            total_rev = 0.0
+                            rto_rev = 0.0
                             if revenue_col:
+                                order_revenue = pd.to_numeric(group[revenue_col], errors="coerce").fillna(0)
+                                total_rev = round(float(order_revenue.sum()), 2)
                                 deliv_mask = ~group[status_col].astype(str).str.upper().str.contains("RTO|RETURN|CANCEL")
-                                deliv_rev = round(float(pd.to_numeric(group.loc[deliv_mask, revenue_col], errors="coerce").sum()), 2)
-                                
+                                deliv_rev = round(float(order_revenue.loc[deliv_mask].sum()), 2)
+                                rto_rev = round(float(order_revenue.loc[group["is_rto"]].sum()), 2)
+
                             state_list.append({
                                 "state": str(state_name).strip(),
                                 "total_orders": tot_ord,
+                                "rto_count": rto_cnt,
                                 "cod_pct": cod_pct,
                                 "rto_pct": rto_pct,
-                                "delivered_revenue": deliv_rev
+                                "total_revenue": total_rev,
+                                "rto_revenue": rto_rev,
+                                "delivered_revenue": deliv_rev,
                             })
                     new_state["state_profitability"] = state_list
 
@@ -1062,8 +1072,17 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             primary_sku = campaign_skus[0] if campaign_skus else ""
             
             sku_entity = next((s for s in new_state.get("skus", []) if s["name"].lower() == primary_sku.lower()), None)
-            sku_aov = sku_entity.get("average_order_value") if sku_entity else blended_aov
-            if not sku_aov:
+            sku_aov = sku_entity.get("average_order_value") if sku_entity else None
+            if not sku_aov or float(sku_aov) == 0.0:
+                same_name_skus = [
+                    s for s in new_state.get("skus", [])
+                    if s.get("name", "").strip().lower() == primary_sku.strip().lower()
+                    and s.get("average_order_value")
+                    and float(s["average_order_value"]) > 0.0
+                ]
+                if same_name_skus:
+                    sku_aov = sum(float(s["average_order_value"]) for s in same_name_skus) / len(same_name_skus)
+            if not sku_aov or float(sku_aov) == 0.0:
                 sku_aov = blended_aov
             
             cm_pre, rto_impact_factor, waste_mult = calculate_sku_margin_params_local(primary_sku or campaign.get("campaign_name", ""), sku_aov)
@@ -1135,7 +1154,18 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 segment["roas_on_delivered_orders"] = 0.0
 
             # Calculate Segment level AOV
-            seg_aov = segment.get("average_order_value") or blended_aov
+            seg_aov = segment.get("average_order_value")
+            if not seg_aov or float(seg_aov) == 0.0:
+                same_name_skus = [
+                    s for s in new_state.get("skus", [])
+                    if s.get("name", "").strip().lower() == seg_name.strip().lower()
+                    and s.get("average_order_value")
+                    and float(s["average_order_value"]) > 0.0
+                ]
+                if same_name_skus:
+                    seg_aov = sum(float(s["average_order_value"]) for s in same_name_skus) / len(same_name_skus)
+            if not seg_aov or float(seg_aov) == 0.0:
+                seg_aov = blended_aov
             segment["average_order_value"] = seg_aov
 
             # Calculate Placed and Realized CAC for segment

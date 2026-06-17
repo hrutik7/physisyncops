@@ -4,7 +4,18 @@ from pydantic import BaseModel, Field, ConfigDict
 
 
 UploadSource = Literal["shopify_orders", "meta_ads", "inventory", "creative_performance", "customer_signals"]
-DecisionState = Literal["pending", "monitoring", "verified", "successful", "unsuccessful", "ignored", "snoozed"]
+DecisionState = Literal[
+    "pending",
+    "acknowledged",
+    "action_planned",
+    "action_executed",
+    "monitoring",
+    "verified",
+    "successful",
+    "unsuccessful",
+    "ignored",
+    "snoozed",
+]
 
 
 def to_camel(snake_str: str) -> str:

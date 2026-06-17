@@ -9,12 +9,28 @@ const severityClass: Record<Severity, string> = {
 
 const stateClass: Record<DecisionState, string> = {
   pending: "border-[#e8ebf2] bg-[#f7f8fb] text-[#68708a]",
+  acknowledged: "border-[#e8ebf2] bg-[#f7f8fb] text-[#4f5872]",
+  action_planned: "border-[#f5ebff] bg-[#faf6ff] text-[#4320c2]",
+  action_executed: "border-[#dbe7ff] bg-[#eef5ff] text-[#185be8]",
   monitoring: "border-[#dbe7ff] bg-[#eef5ff] text-[#185be8]",
   verified: "border-[#d8f2e6] bg-[#ecfff6] text-[#07824b]",
   successful: "border-[#d8f2e6] bg-[#ecfff6] text-[#07824b]",
   unsuccessful: "border-[#ffd9d7] bg-[#fff1f0] text-[#de2b25]",
   ignored: "border-[#e8ebf2] bg-[#f7f8fb] text-[#68708a]",
   snoozed: "border-[#ffe7ba] bg-[#fff8e8] text-[#b86d00]"
+};
+
+const stateLabel: Record<DecisionState, string> = {
+  pending: "Detected",
+  acknowledged: "Acknowledged",
+  action_planned: "Action Planned",
+  action_executed: "Action Executed",
+  monitoring: "Monitoring",
+  verified: "Verified",
+  successful: "Closed",
+  unsuccessful: "Unsuccessful",
+  ignored: "Ignored",
+  snoozed: "Snoozed"
 };
 
 export function Pill({ children, className }: { children: React.ReactNode; className?: string }) {
@@ -25,8 +41,13 @@ export function SeverityPill({ severity }: { severity: Severity }) {
   return <Pill className={severityClass[severity]}>{severity.toUpperCase()}</Pill>;
 }
 
-export function StatePill({ state }: { state: DecisionState }) {
-  return <Pill className={stateClass[state]}>{state.replace("_", " ").toUpperCase()}</Pill>;
+export function StatePill({ state, stale }: { state: DecisionState; stale?: boolean }) {
+  return (
+    <span className="inline-flex flex-col items-start gap-1">
+      <Pill className={stateClass[state]}>{stateLabel[state]}</Pill>
+      {stale ? <Pill className="border-[#ffd9d7] bg-[#fff1f0] text-[#de2b25]">🚨 Stale</Pill> : null}
+    </span>
+  );
 }
 
 export function ConfidenceBar({ value }: { value: number }) {

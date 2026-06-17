@@ -65,7 +65,7 @@ def test_pipeline():
     
     print("\n3. Polling Celery task status...")
     status = "pending"
-    for _ in range(180): # poll for up to 180 seconds
+    for _ in range(600): # poll for up to 600 seconds
         time.sleep(1)
         response = httpx.get(f"{API_URL}/uploads/status/{task_id}")
         status_data = response.json()

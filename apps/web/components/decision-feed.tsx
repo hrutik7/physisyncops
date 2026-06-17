@@ -7,7 +7,7 @@ import {
   Check,
   ChevronDown,
   Filter,
-  Megaphone,
+  ListChecks,
   PackageOpen,
   RefreshCw,
   ShieldAlert,
@@ -19,8 +19,11 @@ import {
 import * as XLSX from "xlsx";
 import { useOpentraStore } from "@/store/use-opentra-store";
 import { cn } from "@/lib/utils";
-import { Decision, Severity, UploadSource } from "@/lib/types";
+import { Decision, RemedyAction, Severity, UploadSource } from "@/lib/types";
 import { Pill, StatePill } from "./ui";
+import { Tooltip } from "./ui/tooltip";
+import { ConfidenceDriversPanel } from "./decision-v2/confidence-drivers";
+import { RemediesModal } from "./decision-v2/remedies-modal";
 
 const iconBySignal = {
   InventoryRisk: PackageOpen,
@@ -32,26 +35,24 @@ const iconBySignal = {
 };
 
 function detectUploadSourceFromSheets(sheetNames: string[]): UploadSource {
-  // Map sheet names to upload sources
-  const sheetLower = sheetNames.map(s => s.toLowerCase());
-  
-  if (sheetLower.some(s => s.includes("shopify") || s.includes("order"))) {
+  const sheetLower = sheetNames.map((s) => s.toLowerCase());
+
+  if (sheetLower.some((s) => s.includes("shopify") || s.includes("order"))) {
     return "shopify_orders";
   }
-  if (sheetLower.some(s => s.includes("meta") || s.includes("ad"))) {
+  if (sheetLower.some((s) => s.includes("meta") || s.includes("ad"))) {
     return "meta_ads";
   }
-  if (sheetLower.some(s => s.includes("inventory"))) {
+  if (sheetLower.some((s) => s.includes("inventory"))) {
     return "inventory";
   }
-  if (sheetLower.some(s => s.includes("creative"))) {
+  if (sheetLower.some((s) => s.includes("creative"))) {
     return "creative_performance";
   }
-  if (sheetLower.some(s => s.includes("customer"))) {
+  if (sheetLower.some((s) => s.includes("customer"))) {
     return "customer_signals";
   }
-  
-  // Default to first sheet name heuristic
+
   return "shopify_orders";
 }
 
@@ -76,13 +77,13 @@ const metricColorBySeverity: Record<Severity, string> = {
   low: "text-[#07824b]"
 };
 
-const confidenceColor = (score: number) => {
-  if (score >= 0.75) return "bg-[#0fb36b]";
-  if (score >= 0.6) return "bg-[#e4b100]";
-  return "bg-[#f59e0b]";
-};
-
 function compactImpact(decision: Decision) {
+  if (decision.impactContext) {
+    return {
+      value: decision.impactContext.atRiskRevenueLabel,
+      label: `${decision.impactContext.impactPercent}% of ${decision.impactContext.contextLabel.toLowerCase()}`
+    };
+  }
   if (decision.businessImpact) {
     if (decision.businessImpact >= 100000) {
       return { value: `Rs ${(decision.businessImpact / 100000).toFixed(2)}L`, label: decision.impactLabel || "revenue at risk" };
@@ -93,28 +94,36 @@ function compactImpact(decision: Decision) {
 }
 
 function statusSubtext(decision: Decision) {
+  if (decision.state === "action_planned") return "Remedy selected";
+  if (decision.state === "action_executed") return "Awaiting monitoring";
   if (decision.state === "monitoring") return "Tracking signals";
+  if (decision.state === "acknowledged") return "Ready for remedy";
   if (decision.state === "ignored") return "Ignored by operator";
   if (decision.state === "snoozed") return "Paused review";
-  if (decision.state === "successful") return "Outcome verified successful";
-  if (decision.state === "verified") return "Signal confirmed";
+  if (decision.state === "successful") return "Outcome verified";
+  if (decision.state === "verified") return "Measuring outcome";
+  if (decision.staleMetadata?.isStale) return decision.staleMetadata.staleLabel;
   return "Waiting for review";
+}
+
+function isActionComplete(state: Decision["state"]) {
+  return ["action_planned", "action_executed", "monitoring", "verified", "successful"].includes(state);
 }
 
 export function DecisionFeed() {
   const decisions = useOpentraStore((state) => state.decisions);
   const selectedDecisionId = useOpentraStore((state) => state.selectedDecisionId);
   const setSelectedDecision = useOpentraStore((state) => state.setSelectedDecision);
-  const updateDecisionState = useOpentraStore((state) => state.updateDecisionState);
+  const selectRemedy = useOpentraStore((state) => state.selectRemedy);
   const snapshots = useOpentraStore((state) => state.snapshots);
   const loading = useOpentraStore((state) => state.loading);
   const error = useOpentraStore((state) => state.error);
   const loadInitialState = useOpentraStore((state) => state.loadInitialState);
   const previewFile = useOpentraStore((state) => state.previewFile);
-  
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load backend state on mount
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [remediesModalDecision, setRemediesModalDecision] = useState<Decision | null>(null);
+
   useEffect(() => {
     loadInitialState();
   }, [loadInitialState]);
@@ -123,21 +132,15 @@ export function DecisionFeed() {
     const file = event.target.files?.[0];
     if (file) {
       try {
-        // Read Excel file to detect sheet names and determine upload source
         const arrayBuffer = await file.arrayBuffer();
         const workbook = XLSX.read(arrayBuffer, { sheets: [] });
         const sheetNames = workbook.SheetNames;
-        
-        // Auto-detect upload source from sheet names
         const detectedSource = detectUploadSourceFromSheets(sheetNames);
-        
-        // Preview with detected source
         await previewFile(file, detectedSource);
       } catch (err) {
         console.error("Error reading Excel file:", err);
       }
     }
-    // reset target value so same file can be uploaded again
     event.target.value = "";
   };
 
@@ -146,6 +149,12 @@ export function DecisionFeed() {
   const emptyCopy = isBaseline
     ? "Your first upload established the operating baseline. Upload the next data refresh to compare changes, verify outcomes, and generate recommendations."
     : "No decision rules are firing on the current data. Upload fresh orders, ads, or inventory data to keep monitoring active.";
+
+  const handleRemedySelect = (remedy: RemedyAction) => {
+    if (!remediesModalDecision) return;
+    selectRemedy(remediesModalDecision.id, remedy);
+    setRemediesModalDecision(null);
+  };
 
   return (
     <section className="min-w-0 bg-[#fbfaff] px-6 py-7">
@@ -156,7 +165,7 @@ export function DecisionFeed() {
             <Pill className="border-[#d9f2e7] bg-[#e9fff4] text-[#07824b]">Live</Pill>
             {loading && <Loader2 className="animate-spin text-[#5b35d5]" size={20} />}
           </div>
-          <p className="mt-3 text-sm text-[#68708a]">AI-powered operational intelligence for your D2C business</p>
+          <p className="mt-3 text-sm text-[#68708a]">Insight → action → outcome. Compare remedies before you commit.</p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           {error && (
@@ -164,7 +173,7 @@ export function DecisionFeed() {
               {error}
             </div>
           )}
-          
+
           <button type="button" className="inline-flex h-11 items-center gap-2 rounded-lg border border-[#e6e8f0] bg-white px-4 text-sm font-medium text-[#172039] shadow-sm">
             <Filter size={17} />
             Filter
@@ -183,14 +192,8 @@ export function DecisionFeed() {
             <UploadCloud size={17} />
             Upload Data
           </button>
-          
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={handleFileChange}
-            accept=".xlsx,.xls,.csv"
-            className="hidden"
-          />
+
+          <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".xlsx,.xls,.csv" className="hidden" />
         </div>
       </header>
 
@@ -205,7 +208,7 @@ export function DecisionFeed() {
       ) : null}
 
       <div className="mt-8 overflow-hidden rounded-xl border border-[#e6e8f0] bg-white shadow-[0_20px_60px_rgba(38,35,64,0.06)]">
-        <div className="grid h-14 grid-cols-[92px_minmax(260px,1.6fr)_150px_130px_150px_132px] items-center border-b border-[#e6e8f0] px-5 text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">
+        <div className="grid h-14 grid-cols-[92px_minmax(260px,1.6fr)_150px_130px_150px_148px] items-center border-b border-[#e6e8f0] px-5 text-xs font-semibold uppercase tracking-[0.08em] text-[#68708a]">
           <span>Priority</span>
           <span>Decision</span>
           <span>Impact</span>
@@ -221,22 +224,22 @@ export function DecisionFeed() {
                 <Check className="h-8 w-8" />
               </div>
               <h3 className="text-lg font-bold text-[#101426]">{emptyTitle}</h3>
-              <p className="mt-2 text-sm text-[#68708a] max-w-sm leading-relaxed">
-                {emptyCopy}
-              </p>
+              <p className="mt-2 text-sm text-[#68708a] max-w-sm leading-relaxed">{emptyCopy}</p>
             </div>
           ) : (
             decisions.map((decision) => {
               const Icon = iconBySignal[decision.signalType as keyof typeof iconBySignal] || ShieldAlert;
               const impact = compactImpact(decision);
               const selected = selectedDecisionId === decision.id;
+              const remedyCount = decision.remedies?.length || decision.recommendedActions?.length || 1;
+
               return (
                 <button
                   key={decision.id}
                   type="button"
                   onClick={() => setSelectedDecision(decision.id)}
                   className={cn(
-                    "grid min-h-[112px] w-full grid-cols-[92px_minmax(260px,1.6fr)_150px_130px_150px_132px] items-center gap-0 px-5 text-left transition hover:bg-[#fbfaff] focus:outline-none",
+                    "grid min-h-[112px] w-full grid-cols-[92px_minmax(260px,1.6fr)_150px_130px_150px_148px] items-center gap-0 px-5 text-left transition hover:bg-[#fbfaff] focus:outline-none",
                     selected && "bg-[#faf8ff] border-l-4 border-l-[#5b35d5]"
                   )}
                 >
@@ -250,54 +253,83 @@ export function DecisionFeed() {
                   </div>
 
                   <div className="min-w-0 pr-6">
-                    <h2 className="truncate text-[17px] font-semibold text-[#101426]" title={decision.title}>{decision.title}</h2>
-                    <p className="mt-2 max-w-[520px] text-sm leading-6 text-[#303954] line-clamp-2" title={decision.explanation}>{decision.explanation}</p>
+                    <h2 className="truncate text-[17px] font-semibold text-[#101426]" title={decision.title}>
+                      {decision.title}
+                    </h2>
+                    <p className="mt-2 max-w-[520px] text-sm leading-6 text-[#303954] line-clamp-2" title={decision.explanation}>
+                      {decision.explanation}
+                    </p>
                   </div>
 
                   <div>
-                    <p className={cn("text-[17px] font-bold", metricColorBySeverity[decision.severity])}>{impact.value}</p>
+                    <Tooltip
+                      content={
+                        decision.impactContext ? (
+                          <div className="space-y-1">
+                            <p>{decision.impactContext.contextLabel}: {decision.impactContext.totalRevenueLabel}</p>
+                            <p>{decision.impactContext.atRiskLabel || "At-risk"}: {decision.impactContext.atRiskRevenueLabel}</p>
+                            {decision.impactContext.shippingWasteLabel ? (
+                              <p>Shipping waste: {decision.impactContext.shippingWasteLabel}</p>
+                            ) : null}
+                            <p>Impact: {decision.impactContext.impactPercent}%</p>
+                          </div>
+                        ) : (
+                          impact.label
+                        )
+                      }
+                    >
+                      <p className={cn("text-[17px] font-bold", metricColorBySeverity[decision.severity])}>{impact.value}</p>
+                    </Tooltip>
                     <p className="mt-1 text-sm text-[#68708a]">{impact.label}</p>
                   </div>
 
-                  <div className="pr-5">
-                    <p className="text-[15px] font-bold text-[#101426]">{Math.round(decision.confidenceScore * 100)}%</p>
-                    <div className="mt-3 h-1.5 rounded-full bg-[#edf0f6]">
-                      <div className={cn("h-1.5 rounded-full", confidenceColor(decision.confidenceScore))} style={{ width: `${Math.round(decision.confidenceScore * 100)}%` }} />
-                    </div>
+                  <div className="pr-5" onClick={(event) => event.stopPropagation()}>
+                    {decision.confidenceDrivers?.length ? (
+                      <ConfidenceDriversPanel score={decision.confidenceScore} drivers={decision.confidenceDrivers} />
+                    ) : (
+                      <>
+                        <p className="text-[15px] font-bold text-[#101426]">{Math.round(decision.confidenceScore * 100)}%</p>
+                        <div className="mt-3 h-1.5 rounded-full bg-[#edf0f6]">
+                          <div
+                            className="h-1.5 rounded-full bg-[#0fb36b]"
+                            style={{ width: `${Math.round(decision.confidenceScore * 100)}%` }}
+                          />
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   <div>
-                    <StatePill state={decision.state} />
+                    <StatePill state={decision.state} stale={decision.staleMetadata?.isStale} />
                     <p className="mt-2 max-w-[120px] text-xs leading-5 text-[#68708a]">{statusSubtext(decision)}</p>
                   </div>
 
-                  <div className="flex justify-end">
-                    {decision.state === "monitoring" || decision.state === "verified" || decision.state === "successful" ? (
+                  <div className="flex justify-end" onClick={(event) => event.stopPropagation()}>
+                    {decision.state === "successful" || decision.state === "verified" ? (
                       <span className="inline-flex h-10 items-center gap-2 rounded-lg border border-[#e6e8f0] bg-white px-4 text-sm font-semibold text-[#172039]">
                         <Check size={16} className="text-[#07824b]" />
-                        Taken
+                        {decision.state === "successful" ? "Closed" : "Verifying"}
+                      </span>
+                    ) : isActionComplete(decision.state) ? (
+                      <span className="inline-flex h-10 items-center gap-2 rounded-lg border border-[#dbe7ff] bg-[#eef5ff] px-4 text-sm font-semibold text-[#185be8]">
+                        <ListChecks size={16} />
+                        In Progress
                       </span>
                     ) : decision.state === "ignored" ? (
-                      <button
-                        type="button"
-                        disabled
-                        className="inline-flex h-10 items-center rounded-lg border border-[#e6e8f0] bg-gray-50 px-4 text-sm font-semibold text-[#68708a] opacity-50"
-                      >
+                      <button type="button" disabled className="inline-flex h-10 items-center rounded-lg border border-[#e6e8f0] bg-gray-50 px-4 text-sm font-semibold text-[#68708a] opacity-50">
                         Ignored
                       </button>
                     ) : (
                       <button
                         type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          updateDecisionState(decision.id, "monitoring");
-                        }}
+                        onClick={() => setRemediesModalDecision(decision)}
                         className={cn(
                           "inline-flex h-10 items-center gap-2 rounded-lg px-4 text-sm font-semibold",
                           selected ? "bg-[#5b35d5] text-white shadow-sm shadow-[#5b35d5]/20" : "border border-[#e6e8f0] bg-white text-[#4320c2]"
                         )}
                       >
-                        Take Action
+                        <ListChecks size={16} />
+                        View Remedies ({remedyCount})
                       </button>
                     )}
                   </div>
@@ -312,6 +344,16 @@ export function DecisionFeed() {
         Load more
         <ChevronDown size={16} />
       </button>
+
+      {remediesModalDecision ? (
+        <RemediesModal
+          decision={remediesModalDecision}
+          remedies={remediesModalDecision.remedies || []}
+          selectedRemedyId={remediesModalDecision.selectedRemedyId}
+          onClose={() => setRemediesModalDecision(null)}
+          onSelect={handleRemedySelect}
+        />
+      ) : null}
     </section>
   );
 }

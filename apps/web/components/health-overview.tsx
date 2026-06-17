@@ -16,6 +16,18 @@ import {
   DollarSign
 } from "lucide-react";
 import { useOpentraStore } from "@/store/use-opentra-store";
+import {
+  buildCustomersDomainExplanation,
+  buildInventoryDomainExplanation,
+  buildKeyMetricExplanations,
+  buildLogisticsDomainExplanation,
+  buildMarketingDomainExplanation,
+  buildProfitabilityDomainExplanation,
+  buildRiskDriverExplanations,
+  buildStabilityExplanation,
+  ScoreExplanation,
+} from "@/lib/health-overview-math";
+import { ScoreExplainer } from "@/components/health-overview-info";
 import { cn } from "@/lib/utils";
 
 export function HealthOverview() {
@@ -28,8 +40,8 @@ export function HealthOverview() {
   const setSelectedDecision = useOpentraStore((state) => state.setSelectedDecision);
 
   // 1. Calculate Active/Pending Alert Counts
-  const pendingCount = decisions.filter((d) => d.state === "pending").length;
-  const monitoringCount = decisions.filter((d) => d.state === "monitoring").length;
+  const pendingCount = decisions.filter((d) => ["pending", "acknowledged", "action_planned"].includes(d.state)).length;
+  const monitoringCount = decisions.filter((d) => ["action_executed", "monitoring", "verified"].includes(d.state)).length;
   const successfulCount = decisions.filter((d) => d.state === "successful").length;
   const totalCount = decisions.length;
 
@@ -40,7 +52,7 @@ export function HealthOverview() {
 
   // 2. Dynamic Operational Stability Score Calculation
   // Base score is 98. We deduct points based on unresolved (pending/monitoring) risks.
-  const activeUnresolvedDecisions = decisions.filter((d) => d.state === "pending" || d.state === "monitoring");
+  const activeUnresolvedDecisions = decisions.filter((d) => !["successful", "ignored", "unsuccessful"].includes(d.state));
   const stabilityDeduction = activeUnresolvedDecisions.reduce((sum, d) => {
     if (d.severity === "high") return sum + 15;
     if (d.severity === "medium") return sum + 8;
@@ -113,6 +125,35 @@ export function HealthOverview() {
   const mediumHeight = activeUnresolvedDecisions.filter((d) => d.severity === "medium").length * 8 || 4;
   const lowHeight = 6;
 
+  const stabilityExplanation = buildStabilityExplanation(decisions);
+  const domainExplanations = {
+    inventory: buildInventoryDomainExplanation(skus),
+    marketing: buildMarketingDomainExplanation(campaigns),
+    logistics: buildLogisticsDomainExplanation(campaigns),
+    customers: buildCustomersDomainExplanation(customerSegments),
+    profitability: buildProfitabilityDomainExplanation(campaigns),
+  };
+  const metricExplanations = buildKeyMetricExplanations(
+    campaigns,
+    customerSegments,
+    totalRevenue,
+    totalAdSpend,
+    totalOrders,
+    newCustomers,
+    avgRoasDelivered,
+    avgRtoRate,
+    avgRepeatRate,
+    avgMargin
+  );
+  const tightestSku = skus.length
+    ? skus.reduce((tightest, sku) => (sku.projectedStockoutDays < tightest.projectedStockoutDays ? sku : tightest))
+    : null;
+  const riskDriverExplanations = buildRiskDriverExplanations(
+    avgRtoRate,
+    minStockoutDays,
+    tightestSku?.name ?? null
+  );
+
   return (
     <div className="thin-scrollbar h-screen overflow-y-auto bg-[#fbfaff] p-6 lg:p-8">
       {/* Page Header */}
@@ -151,7 +192,7 @@ export function HealthOverview() {
             <div className="rounded-2xl border border-[#e6e8f0] bg-white p-5 shadow-[0_4px_20px_rgba(0,0,0,0.02)] flex flex-col items-center text-center justify-between min-h-[220px]">
               <div className="w-full flex items-center justify-between text-left">
                 <span className="text-xs font-bold uppercase tracking-wider text-[#68708a]">Stability Score</span>
-                <span className="h-4 w-4 rounded-full bg-[#ecfff6] text-[#07824b] grid place-items-center text-[10px] font-bold">i</span>
+                <ScoreExplainer explanation={stabilityExplanation} />
               </div>
               
               <div className="relative my-3 flex items-center justify-center">
@@ -185,20 +226,14 @@ export function HealthOverview() {
             <div className="rounded-2xl border border-[#e6e8f0] bg-white p-5 shadow-[0_4px_20px_rgba(0,0,0,0.02)] flex flex-col justify-between">
               <div className="flex items-center justify-between mb-4">
                 <span className="text-xs font-bold uppercase tracking-wider text-[#68708a]">Domain Health</span>
-                <span className="h-4 w-4 rounded-full bg-[#ecfff6] text-[#07824b] grid place-items-center text-[10px] font-bold">i</span>
               </div>
 
               <div className="grid grid-cols-5 gap-3 h-full items-end">
-                {/* Inventory */}
-                <DomainCard label="Inventory" score={inventoryScore} status={inventoryStatus} color={inventoryScore >= 80 ? "green" : inventoryScore >= 60 ? "orange" : "red"} icon={Package} sparkPoints={inventoryScore >= 80 ? "0,15 15,10 30,12 45,5 60,18" : "0,5 15,12 30,14 45,18 60,19"} />
-                {/* Marketing */}
-                <DomainCard label="Marketing" score={marketingScore} status={marketingStatus} color={marketingScore >= 80 ? "green" : "orange"} icon={Megaphone} sparkPoints={marketingScore >= 80 ? "0,8 15,12 30,10 45,6 60,14" : "0,18 15,12 30,19 45,15 60,10"} />
-                {/* Logistics */}
-                <DomainCard label="Logistics" score={logisticsScore} status={logisticsStatus} color={logisticsScore >= 70 ? "green" : logisticsScore >= 50 ? "orange" : "red"} icon={Truck} sparkPoints={logisticsScore >= 70 ? "0,15 15,12 30,8 45,7 60,10" : "0,10 15,16 30,8 45,19 60,17"} />
-                {/* Customers */}
-                <DomainCard label="Customers" score={customerScore} status={customerStatus} color={customerScore >= 80 ? "green" : "orange"} icon={Users} sparkPoints="0,19 15,14 30,16 45,9 60,11" />
-                {/* Profitability */}
-                <DomainCard label="Profitability" score={profitabilityScore} status={profitabilityStatus} color={profitabilityScore >= 75 ? "blue" : "orange"} icon={TrendingUp} sparkPoints="0,16 15,18 30,10 45,13 60,8" />
+                <DomainCard label="Inventory" score={inventoryScore} status={inventoryStatus} color={inventoryScore >= 80 ? "green" : inventoryScore >= 60 ? "orange" : "red"} icon={Package} sparkPoints={inventoryScore >= 80 ? "0,15 15,10 30,12 45,5 60,18" : "0,5 15,12 30,14 45,18 60,19"} explanation={domainExplanations.inventory} />
+                <DomainCard label="Marketing" score={marketingScore} status={marketingStatus} color={marketingScore >= 80 ? "green" : "orange"} icon={Megaphone} sparkPoints={marketingScore >= 80 ? "0,8 15,12 30,10 45,6 60,14" : "0,18 15,12 30,19 45,15 60,10"} explanation={domainExplanations.marketing} />
+                <DomainCard label="Logistics" score={logisticsScore} status={logisticsStatus} color={logisticsScore >= 70 ? "green" : logisticsScore >= 50 ? "orange" : "red"} icon={Truck} sparkPoints={logisticsScore >= 70 ? "0,15 15,12 30,8 45,7 60,10" : "0,10 15,16 30,8 45,19 60,17"} explanation={domainExplanations.logistics} />
+                <DomainCard label="Customers" score={customerScore} status={customerStatus} color={customerScore >= 80 ? "green" : "orange"} icon={Users} sparkPoints="0,19 15,14 30,16 45,9 60,11" explanation={domainExplanations.customers} />
+                <DomainCard label="Profitability" score={profitabilityScore} status={profitabilityStatus} color={profitabilityScore >= 75 ? "blue" : "orange"} icon={TrendingUp} sparkPoints="0,16 15,18 30,10 45,13 60,8" explanation={domainExplanations.profitability} />
               </div>
             </div>
 
@@ -261,18 +296,17 @@ export function HealthOverview() {
             <div className="rounded-2xl border border-[#e6e8f0] bg-white p-5 shadow-[0_4px_20px_rgba(0,0,0,0.02)]">
               <div className="flex items-center justify-between mb-4">
                 <span className="text-xs font-bold uppercase tracking-wider text-[#68708a]">Key Metrics (vs last 7 days)</span>
-                <span className="h-4 w-4 rounded-full bg-[#ecfff6] text-[#07824b] grid place-items-center text-[10px] font-bold">i</span>
               </div>
 
               <div className="space-y-2.5 text-xs">
-                <MetricRow label="Revenue" value={`₹${(totalRevenue / 100000).toFixed(1)}L`} change="14.6%" up />
-                <MetricRow label="Orders (Delivered)" value={totalOrders.toLocaleString()} change="11.3%" up />
-                <MetricRow label="Ad Spend" value={`₹${(totalAdSpend / 100000).toFixed(1)}L`} change="16.8%" up />
-                <MetricRow label="ROAS (Realized)" value={`${avgRoasDelivered.toFixed(2)}x`} change="6.2%" />
-                <MetricRow label="RTO Rate (Delivered)" value={`${avgRtoRate.toFixed(1)}%`} change="2.1%" />
-                <MetricRow label="New Customers" value={newCustomers.toLocaleString()} change="5.4%" up />
-                <MetricRow label="Repeat Rate" value={`${avgRepeatRate.toFixed(1)}%`} change="3.2%" up />
-                <MetricRow label="Contribution Margin %" value={`${avgMargin.toFixed(1)}%`} change="1.4%" />
+                <MetricRow label="Revenue" value={`₹${(totalRevenue / 100000).toFixed(1)}L`} change="14.6%" up explanation={metricExplanations.revenue} />
+                <MetricRow label="Orders (Delivered)" value={totalOrders.toLocaleString()} change="11.3%" up explanation={metricExplanations.orders} />
+                <MetricRow label="Ad Spend" value={`₹${(totalAdSpend / 100000).toFixed(1)}L`} change="16.8%" up explanation={metricExplanations.adSpend} />
+                <MetricRow label="ROAS (Realized)" value={`${avgRoasDelivered.toFixed(2)}x`} change="6.2%" explanation={metricExplanations.roas} />
+                <MetricRow label="RTO Rate (Delivered)" value={`${avgRtoRate.toFixed(1)}%`} change="2.1%" explanation={metricExplanations.rto} />
+                <MetricRow label="New Customers" value={newCustomers.toLocaleString()} change="5.4%" up explanation={metricExplanations.newCustomers} />
+                <MetricRow label="Repeat Rate" value={`${avgRepeatRate.toFixed(1)}%`} change="3.2%" up explanation={metricExplanations.repeatRate} />
+                <MetricRow label="Contribution Margin %" value={`${avgMargin.toFixed(1)}%`} change="1.4%" explanation={metricExplanations.margin} />
               </div>
             </div>
 
@@ -342,9 +376,9 @@ export function HealthOverview() {
             <div className="rounded-2xl border border-[#e6e8f0] bg-white p-5 shadow-[0_4px_20px_rgba(0,0,0,0.02)] flex flex-col justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-[#68708a] block mb-4">Top Risk Drivers</span>
               <div className="space-y-3.5">
-                <DriverBar label="RTO rate increase" pct={Math.round(avgRtoRate * 1.8)} color="#de2b25" />
+                <DriverBar label="RTO rate increase" pct={Math.round(avgRtoRate * 1.8)} color="#de2b25" explanation={riskDriverExplanations.rto} />
                 <DriverBar label="High COD dependency" pct={24} color="#e08b00" />
-                <DriverBar label="Inventory coverage low" pct={minStockoutDays < 7 ? 32 : 5} color="#e08b00" />
+                <DriverBar label="Inventory coverage low" pct={minStockoutDays < 7 ? 32 : 5} color="#e08b00" explanation={riskDriverExplanations.inventory} />
                 <DriverBar label="CAC inflation" pct={14} color="#d6b700" />
                 <DriverBar label="Creative fatigue" pct={12} color="#058a50" />
               </div>
@@ -490,7 +524,8 @@ function DomainCard({
   status, 
   color, 
   icon: Icon,
-  sparkPoints 
+  sparkPoints,
+  explanation,
 }: { 
   label: string; 
   score: number; 
@@ -498,6 +533,7 @@ function DomainCard({
   color: "green" | "orange" | "red" | "blue";
   icon: any;
   sparkPoints: string;
+  explanation: ScoreExplanation;
 }) {
   const toneClasses = {
     green: { bg: "bg-[#ecfff6]", text: "text-[#07824b]", stroke: "#0fb36b" },
@@ -514,8 +550,11 @@ function DomainCard({
         <Icon size={16} />
       </div>
       
-      <div className="my-2.5">
-        <span className="text-[10px] font-bold text-[#68708a] block tracking-wide">{label}</span>
+      <div className="my-2.5 w-full">
+        <div className="flex items-center justify-center gap-1">
+          <span className="text-[10px] font-bold text-[#68708a] tracking-wide">{label}</span>
+          <ScoreExplainer explanation={explanation} size={11} />
+        </div>
         <span className={cn("text-[10px] font-bold mt-0.5 inline-block px-2 py-0.5 rounded-full uppercase tracking-wider transition-colors duration-500", tone.bg, tone.text)}>
           {status}
         </span>
@@ -537,10 +576,25 @@ function DomainCard({
 }
 
 /* Helper Metric Row Component */
-function MetricRow({ label, value, change, up }: { label: string; value: string; change: string; up?: boolean }) {
+function MetricRow({
+  label,
+  value,
+  change,
+  up,
+  explanation,
+}: {
+  label: string;
+  value: string;
+  change: string;
+  up?: boolean;
+  explanation?: ScoreExplanation;
+}) {
   return (
     <div className="flex items-center justify-between border-b border-[#f4f6fa] pb-2 last:border-0 last:pb-0">
-      <span className="text-[#303954] font-medium">{label}</span>
+      <div className="flex items-center gap-1.5">
+        <span className="text-[#303954] font-medium">{label}</span>
+        {explanation ? <ScoreExplainer explanation={explanation} size={11} /> : null}
+      </div>
       <div className="flex items-center gap-3 font-semibold">
         <span className="text-[#101426]">{value}</span>
         <span className={cn(
@@ -642,11 +696,24 @@ function InsightItem({ icon: Icon, desc, theme }: { icon: any; desc: string; the
 }
 
 /* Helper Risk Driver Bar Component */
-function DriverBar({ label, pct, color }: { label: string; pct: number; color: string }) {
+function DriverBar({
+  label,
+  pct,
+  color,
+  explanation,
+}: {
+  label: string;
+  pct: number;
+  color: string;
+  explanation?: ScoreExplanation;
+}) {
   return (
     <div>
       <div className="flex items-center justify-between text-[11px] mb-1.5 font-medium">
-        <span className="text-[#303954]">{label}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[#303954]">{label}</span>
+          {explanation ? <ScoreExplainer explanation={explanation} size={11} /> : null}
+        </div>
         <span className="font-bold text-[#101426]">{pct}%</span>
       </div>
       <div className="h-1.5 rounded-full bg-[#f4f6fa]">

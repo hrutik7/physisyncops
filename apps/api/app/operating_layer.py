@@ -35,7 +35,8 @@ def ensure_default_goals(db: Session, brand_id: str) -> None:
 
 def upsert_unit_economics_from_state(db: Session, brand_id: str, state: dict[str, Any]) -> None:
     aov = state.get("average_order_value") or state.get("aov")
-    for sku in state.get("skus", []):
+    skus = state.get("skus", [])
+    for sku in skus:
         sku_id = sku.get("sku_id")
         if not sku_id:
             continue
@@ -45,7 +46,21 @@ def upsert_unit_economics_from_state(db: Session, brand_id: str, state: dict[str
             .first()
         )
         margin = float(sku.get("contribution_margin_after_rto", 35))
-        sku_aov = sku.get("average_order_value") or aov
+        sku_aov = sku.get("average_order_value")
+        if not sku_aov or float(sku_aov) == 0.0:
+            sku_name = sku.get("name")
+            if sku_name:
+                same_name_skus = [
+                    s for s in skus
+                    if s.get("name", "").strip().lower() == sku_name.strip().lower()
+                    and s.get("average_order_value")
+                    and float(s["average_order_value"]) > 0.0
+                ]
+                if same_name_skus:
+                    sku_aov = sum(float(s["average_order_value"]) for s in same_name_skus) / len(same_name_skus)
+        if not sku_aov or float(sku_aov) == 0.0:
+            sku_aov = aov
+        
         if econ is None:
             econ = UnitEconomics(brand_id=brand_id, sku_id=sku_id)
             db.add(econ)

@@ -123,6 +123,47 @@ def test_dynamic_calculations():
         assert inv_sig.business_impact == 100000, f"Expected business impact of 100,000, got {inv_sig.business_impact}"
         assert "SKU-level AOV is Rs 4,000.00" in inv_sig.cross_system_signals, "Expected SKU-level AOV in cross system signals"
         print("✅ Rule Engine integration with SKU-level AOV passed!")
+ 
+        # 5. Test Same-Name SKU AOV Fallback
+        print("\nTesting same-name SKU AOV fallback...")
+        mock_state_fallback = {
+            "average_order_value": 3000.0, # Brand default AOV
+            "brand_repeat_rate": 20.0,
+            "skus": [
+                {
+                    "sku_id": "sku-alpha-variant1",
+                    "name": "Alpha Product",
+                    "inventory_left": 100,
+                    "daily_velocity": 1.0,
+                    "projected_stockout_days": 100.0,
+                    "average_order_value": 1500.0, # Valid SKU AOV for variant 1
+                    "spend_growth_percent": 0.0
+                },
+                {
+                    "sku_id": "sku-alpha-variant2",
+                    "name": "Alpha Product",
+                    "inventory_left": 2,
+                    "daily_velocity": 1.0,
+                    "projected_stockout_days": 2.0, # Stockout risk!
+                    "average_order_value": 0.0,    # 0.0 AOV (needs fallback to variant 1)
+                    "spend_growth_percent": 25.0
+                }
+            ],
+            "campaigns": []
+        }
+        signals_fallback = SignalDetectionEngine.detect(mock_state_fallback, freshness=1.0)
+        
+        # Verify that InventoryRisk uses variant 1's AOV (1500.0) instead of brand-level AOV (3000.0)
+        fallback_signals = [s for s in signals_fallback if s.signal_type == "InventoryRisk"]
+        assert len(fallback_signals) == 1, "Expected 1 InventoryRisk signal"
+        f_sig = fallback_signals[0]
+        
+        # Daily revenue = daily_velocity (1.0) * Fallback AOV (1500.0) = 1500.0
+        # Stockout days = 7.0 - 2.0 = 5.0
+        # Revenue at risk = 1.0 * 1500.0 * 5.0 = 7500
+        assert f_sig.business_impact == 7500, f"Expected business impact of 7500 (using same-name SKU AOV), got {f_sig.business_impact}"
+        assert "SKU-level AOV is Rs 1,500.00" in f_sig.cross_system_signals, "Expected same-name fallback AOV in signals"
+        print("✅ Same-name SKU AOV fallback passed!")
 
         # Clean up database
         db.query(UnitEconomics).filter(UnitEconomics.brand_id == brand_id).delete()

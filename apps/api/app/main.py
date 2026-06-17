@@ -26,6 +26,7 @@ from .models import (
     UnitEconomics,
     VerificationScorecard,
 )
+from .decision_v2 import enrich_decision_v2
 from .operating_layer import (
     ensure_default_goals,
     ensure_intervention,
@@ -128,18 +129,26 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
         scorecard = None
         if intervention:
             scorecard = db.query(VerificationScorecard).filter_by(intervention_id=intervention.id).first()
+        enrichment = enrich_decision_v2(d, snapshot)
+        effective_confidence = enrichment.pop("effectiveConfidenceScore", d.confidence_score)
+        display_title = enrichment.pop("displayTitle", None)
+        display_explanation = enrichment.pop("displayExplanation", None)
+        display_recommendation = enrichment.pop("displayRecommendation", None)
+        display_severity = enrichment.pop("displaySeverity", None)
+        effective_business_impact = enrichment.pop("effectiveBusinessImpact", None)
+        effective_impact_label = enrichment.pop("effectiveImpactLabel", None)
         dec_list.append({
             "id": d.id,
-            "title": d.title,
+            "title": display_title or d.title,
             "signalType": d.issue_type.replace(" ", ""),
             "issueType": d.issue_type,
-            "severity": d.severity,
-            "confidenceScore": d.confidence_score,
-            "businessImpact": d.business_impact,
-            "impactLabel": d.impact_label or f"Rs {d.business_impact} impact",
-            "explanation": d.explanation,
+            "severity": display_severity or d.severity,
+            "confidenceScore": effective_confidence,
+            "businessImpact": effective_business_impact if effective_business_impact is not None else d.business_impact,
+            "impactLabel": effective_impact_label or d.impact_label or f"Rs {d.business_impact} impact",
+            "explanation": display_explanation or d.explanation,
             "rule": d.rule,
-            "recommendation": d.recommendation,
+            "recommendation": display_recommendation or d.recommendation,
             "affectedCampaigns": d.affected_campaigns,
             "affectedSkus": d.affected_skus,
             "timestamp": d.created_at.strftime("%I:%M %p"),
@@ -166,6 +175,8 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
                 "metrics": scorecard.metrics,
                 "summary": scorecard.summary,
             } if scorecard else None,
+            "selectedRemedyId": (intervention.expected_effect or {}).get("selectedRemedyId") if intervention else None,
+            **enrichment,
         })
         
     for d in dec_list:
@@ -177,6 +188,15 @@ def get_state(brand_id: str, db: Session = Depends(get_db)):
             d["signalType"] = "AOVDilution"
         elif "roas < 1.5 AND frequency <= 1.5" in rule_str or "New Launch" in title_str:
             d["signalType"] = "NewLaunchRisk"
+        elif (
+            "state_orders" in rule_str
+            or "State Profitability" in title_str
+            or "Regional COD Risk" in title_str
+            or d["issueType"] == "State RTO leakage"
+        ):
+            d["signalType"] = "StateRTOLeakage"
+        elif "spend >= 50000" in rule_str or "Strategic Audit" in title_str or d["issueType"] == "Marketing pressure":
+            d["signalType"] = "AudienceAudit"
         elif d["issueType"] == "Campaign-level RTO spike":
             d["signalType"] = "CampaignRTOSpike"
         elif d["issueType"] == "Inventory pressure":
@@ -334,12 +354,62 @@ def get_task_status(task_id: str) -> dict:
         return {"status": "pending", "state": res.state}
 
 
+class DecisionRemedyRequest(BaseModel):
+    remedy_id: str
+    remedy_label: str
+
+
+@app.post("/decisions/{decision_id}/remedy")
+def select_decision_remedy(decision_id: str, payload: DecisionRemedyRequest, db: Session = Depends(get_db)) -> dict:
+    from sqlalchemy.orm.attributes import flag_modified
+    from datetime import datetime as dt
+
+    decision = db.get(Decision, decision_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="Decision not found")
+
+    decision.state = "action_planned"
+    decision.timeline = [
+        *decision.timeline,
+        {
+            "id": f"evt_remedy_{decision_id[:8]}",
+            "time": dt.now().strftime("%I:%M %p"),
+            "title": "Action planned",
+            "description": f"Operator selected: {payload.remedy_label}",
+            "kind": "human",
+        },
+    ]
+    flag_modified(decision, "timeline")
+
+    snapshot = db.get(BusinessSnapshot, decision.snapshot_id)
+    if snapshot:
+        intervention = ensure_intervention(db, snapshot.brand_id, decision, "planned")
+        intervention.expected_effect = {
+            **(intervention.expected_effect or {}),
+            "selectedRemedyId": payload.remedy_id,
+            "selectedRemedyLabel": payload.remedy_label,
+        }
+        ensure_scorecard(db, snapshot.brand_id, decision, intervention, "pending")
+    db.commit()
+    return {"decision_id": decision.id, "state": decision.state, "selectedRemedyId": payload.remedy_id}
+
+
 @app.post("/decisions/{decision_id}/state")
 def update_decision_state(decision_id: str, payload: DecisionStateRequest, db: Session = Depends(get_db)) -> dict:
     from sqlalchemy.orm.attributes import flag_modified
     from datetime import datetime as dt
 
-    allowed = {"monitoring", "ignored", "snoozed", "verified", "successful", "unsuccessful"}
+    allowed = {
+        "acknowledged",
+        "action_planned",
+        "action_executed",
+        "monitoring",
+        "ignored",
+        "snoozed",
+        "verified",
+        "successful",
+        "unsuccessful",
+    }
     if payload.state not in allowed:
         raise HTTPException(status_code=422, detail=f"State must be one of: {', '.join(allowed)}")
     decision = db.get(Decision, decision_id)

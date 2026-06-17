@@ -22,7 +22,7 @@ import { useOpentraStore } from "@/store/use-opentra-store";
 
 export function Sidebar() {
   const decisions = useOpentraStore((state) => state.decisions);
-  const pendingCount = decisions.filter((d) => d.state === "pending").length;
+  const pendingCount = decisions.filter((d) => ["pending", "acknowledged", "action_planned"].includes(d.state)).length;
   const resetDatabase = useOpentraStore((state) => state.resetDatabase);
   const snapshots = useOpentraStore((state) => state.snapshots);
   const activeView = useOpentraStore((state) => state.activeView);
