@@ -1,10 +1,9 @@
 "use client";
 
-import { X, Zap, Clock3, TrendingDown } from "lucide-react";
+import { X, Zap, Target } from "lucide-react";
 import { Decision, RemedyAction } from "@/lib/types";
-import { effortLabel, effortTone } from "@/lib/decision-v2";
 import { RecoveryLabel } from "./recovery-label";
-import { RemedyEffortTable } from "./remedy-effort-table";
+import { RemedyDifficultyChart } from "./remedy-difficulty-chart";
 import { cn } from "@/lib/utils";
 
 function OutcomePreview({ remedy }: { remedy: RemedyAction }) {
@@ -48,7 +47,7 @@ export function RemediesModal({
           <div>
             <p className="text-xs font-bold uppercase tracking-[0.08em] text-[#4320c2]">Choose Action</p>
             <h3 className="mt-1 text-lg font-bold text-[#101426]">{decision.title}</h3>
-            <p className="mt-1 text-sm text-[#68708a]">Compare remedies by effort, expected recovery, and operational fit.</p>
+            <p className="mt-1 text-sm text-[#68708a]">Pick what to do first, then compare how hard each option is to execute.</p>
           </div>
           <button
             type="button"
@@ -59,64 +58,61 @@ export function RemediesModal({
           </button>
         </div>
 
-        <div className="thin-scrollbar flex-1 space-y-4 overflow-y-auto p-6">
-          {remedies.map((remedy) => {
-            const selected = selectedRemedyId === remedy.id;
-            return (
-              <button
-                key={remedy.id}
-                type="button"
-                onClick={() => onSelect(remedy)}
-                className={cn(
-                  "w-full rounded-xl border p-4 text-left transition hover:border-[#cdbdff] hover:bg-[#faf8ff]",
-                  selected ? "border-[#5b35d5] bg-[#faf8ff] shadow-[0_8px_24px_rgba(91,53,213,0.08)]" : "border-[#e6e8f0] bg-white"
-                )}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-base">{remedy.medal}</span>
-                      <span className="text-xs font-bold uppercase tracking-[0.08em] text-[#4320c2]">
-                        {remedy.rank === "primary" ? "Primary" : "Alternative"}
-                      </span>
-                      <span className={cn("rounded-full border px-2 py-0.5 text-[11px] font-bold", effortTone(remedy.effort))}>
-                        {effortLabel(remedy.effort)} effort
-                      </span>
-                    </div>
-                    <p className="mt-2 text-[15px] font-semibold leading-6 text-[#101426]">{remedy.label}</p>
-                  </div>
-                  <div className="shrink-0 text-right">
-                    <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-[#68708a]">
-                      {remedy.recoveryLabel || "Potential Value"}
-                    </p>
-                    <p className="mt-1 text-lg font-black">
-                      <RecoveryLabel value={remedy.expectedRiskReductionLabel} explanation={remedy.recoveryExplanation} />
-                    </p>
-                  </div>
-                </div>
-
-                <OutcomePreview remedy={remedy} />
-
-                <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-[#68708a]">
-                  <span className="inline-flex items-center gap-1.5">
-                    <Clock3 size={14} />
-                    {effortLabel(remedy.effort)} execution cost
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <TrendingDown size={14} />
-                    {remedy.recoveryLabel || "Potential value"} {remedy.expectedRiskReductionLabel}
-                  </span>
-                </div>
-              </button>
-            );
-          })}
-          <div className="rounded-xl border border-[#edf0f6] bg-[#fcfcff] p-4">
-            <h4 className="text-xs font-bold uppercase tracking-[0.08em] text-[#68708a]">Action Difficulty</h4>
-            <p className="mt-1 text-xs text-[#68708a]">Compare impact against execution effort before committing.</p>
-            <div className="mt-3">
-              <RemedyEffortTable remedies={remedies} />
+        <div className="thin-scrollbar flex-1 space-y-5 overflow-y-auto p-6">
+          <section>
+            <div className="mb-3 flex items-center gap-2">
+              <Target size={14} className="text-[#4320c2]" />
+              <h4 className="text-xs font-bold uppercase tracking-[0.08em] text-[#4320c2]">Recommended Actions</h4>
             </div>
-          </div>
+            <div className="space-y-3">
+              {remedies.map((remedy) => {
+                const selected = selectedRemedyId === remedy.id;
+                return (
+                  <button
+                    key={remedy.id}
+                    type="button"
+                    onClick={() => onSelect(remedy)}
+                    className={cn(
+                      "w-full rounded-xl border p-4 text-left transition hover:border-[#cdbdff] hover:bg-[#faf8ff]",
+                      selected ? "border-[#5b35d5] bg-[#faf8ff] shadow-[0_8px_24px_rgba(91,53,213,0.08)]" : "border-[#e6e8f0] bg-white"
+                    )}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-base">{remedy.medal}</span>
+                          <span className="text-xs font-bold uppercase tracking-[0.08em] text-[#4320c2]">
+                            {remedy.rank === "primary" ? "Primary action" : "Alternative action"}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-[15px] font-semibold leading-6 text-[#101426]">{remedy.label}</p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-[#68708a]">
+                          {remedy.recoveryLabel || "Potential Value"}
+                        </p>
+                        <p className="mt-1 text-lg font-black">
+                          <RecoveryLabel value={remedy.expectedRiskReductionLabel} explanation={remedy.recoveryExplanation} />
+                        </p>
+                      </div>
+                    </div>
+
+                    <OutcomePreview remedy={remedy} />
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="rounded-xl border border-[#edf0f6] bg-[#fcfcff] p-4">
+            <h4 className="text-xs font-bold uppercase tracking-[0.08em] text-[#68708a]">Action Difficulty</h4>
+            <p className="mt-1 text-xs text-[#68708a]">
+              How hard each option is to deploy — effort level, turnaround time, and share of modeled impact.
+            </p>
+            <div className="mt-3">
+              <RemedyDifficultyChart remedies={remedies} />
+            </div>
+          </section>
         </div>
 
         <div className="flex items-center justify-between border-t border-[#edf0f6] bg-[#fbfaff] px-6 py-4">

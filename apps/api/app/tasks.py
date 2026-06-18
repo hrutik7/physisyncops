@@ -109,6 +109,79 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
+INVENTORY_HEADER_TOKENS = {
+    "code",
+    "sr no.",
+    "sr no",
+    "type",
+    "color",
+    "size",
+    "opening stock",
+    "usable stock",
+    "damaged stock",
+    "average",
+    "inward",
+    "outward",
+    "lead time of supplier",
+    "norms",
+    "nan",
+}
+
+
+def compute_blended_aov(revenue_values: pd.Series) -> float | None:
+    """Average order value from rows with valid revenue only."""
+    valid = pd.to_numeric(revenue_values, errors="coerce").dropna()
+    if valid.empty:
+        return None
+    return round(float(valid.sum()) / len(valid), 2)
+
+
+def align_inventory_headers(inv_df: pd.DataFrame) -> pd.DataFrame:
+    """Detect the real header row in operator inventory sheets."""
+    inv_df = inv_df.copy()
+    inv_cols_lower = [str(c).strip().lower() for c in inv_df.columns]
+    if any(token in inv_cols_lower for token in ["usable stock", "opening stock", "sku", "sku code"]):
+        return inv_df
+
+    header_row_idx = None
+    for idx, row in inv_df.iterrows():
+        row_vals = [str(v).strip().lower() for v in row.values if pd.notna(v)]
+        if any(h in row_vals for h in ["sr no", "sr no.", "code", "opening stock", "usable stock"]):
+            header_row_idx = idx
+            break
+    if header_row_idx is not None:
+        inv_df.columns = [str(c).strip() for c in inv_df.iloc[header_row_idx]]
+        inv_df = inv_df.iloc[header_row_idx + 1:].reset_index(drop=True)
+    return inv_df
+
+
+def resolve_inventory_sku_column(columns: list[str]) -> str | None:
+    """Prefer explicit SKU columns over generic variant code headers."""
+    normalized = {column: normalize_header(column) for column in columns}
+    priority = (
+        ("sku code",),
+        ("sku", "item code", "item_code", "sku_code", "variant sku", "variant_sku"),
+        ("variant",),
+        ("code",),
+    )
+    for needles in priority:
+        for column, clean_column in normalized.items():
+            if any(needle == clean_column or needle in clean_column for needle in needles):
+                return column
+    return None
+
+
+def is_inventory_placeholder_row(sku_code: str, product_name: str | None = None) -> bool:
+    code = sku_code.strip().lower()
+    if not code or code == "nan":
+        return True
+    if code in INVENTORY_HEADER_TOKENS:
+        return True
+    if product_name and product_name.strip().lower() in INVENTORY_HEADER_TOKENS:
+        return True
+    return False
+
+
 def safe_series_sum(series: pd.Series, default: float = 0.0) -> float:
     values = pd.to_numeric(series, errors="coerce").dropna()
     if values.empty:
@@ -296,22 +369,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
             inv_df = resolve_sheet("inventory", "stock")
             if inv_df is not None:
                 print("🔍 [STEP 1/4] Processing 'inventory' sheet dynamically...", flush=True)
-                
-                # Align headers if the first few columns are Unnamed (e.g. from title rows)
-                if any("unnamed" in str(c).lower() for c in inv_df.columns):
-                    header_row_idx = None
-                    for idx, row in inv_df.iterrows():
-                        row_vals = [str(v).strip().lower() for v in row.values if v is not None]
-                        if any(h in row_vals for h in ["sr no", "sr no.", "code", "opening stock", "usable stock"]):
-                            header_row_idx = idx
-                            break
-                    if header_row_idx is not None:
-                        inv_df.columns = [str(c).strip() for c in inv_df.iloc[header_row_idx]]
-                        inv_df = inv_df.iloc[header_row_idx + 1:].reset_index(drop=True)
 
+                inv_df = align_inventory_headers(inv_df)
                 inv_df.columns = [str(c).strip().lower() for c in inv_df.columns]
-                
-                sku_col = next((c for c in inv_df.columns if any(alias in c for alias in ["sku", "variant", "code", "item_code", "sku_code"])), None)
+
+                sku_col = resolve_inventory_sku_column(list(inv_df.columns))
+                type_col = next((c for c in inv_df.columns if c == "type" or c.endswith(" type")), None)
                 stock_col = next((c for c in inv_df.columns if "usable" in c), None)
                 if not stock_col:
                     stock_col = next((c for c in inv_df.columns if "stock" in c or "left" in c or "inventory" in c or "qty" in c or "available" in c), None)
@@ -324,15 +387,26 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         new_state["skus"] = []
                         
                     for _, row in inv_df.iterrows():
-                        sku_name = str(row[sku_col]).strip()
-                        if not sku_name or sku_name.lower() == "nan":
+                        sku_code = str(row[sku_col]).strip()
+                        product_name = str(row[type_col]).strip() if type_col and pd.notna(row.get(type_col)) else sku_code
+                        if is_inventory_placeholder_row(sku_code, product_name):
                             continue
-                        
-                        sku = next((s for s in new_state["skus"] if s["name"].lower() == sku_name.lower() or s["sku_id"].lower() == sku_name.lower() or s["sku_id"].lower() == f"sku-{sku_name.lower()}"), None)
+
+                        sku = next(
+                            (
+                                s
+                                for s in new_state["skus"]
+                                if s["sku_id"].lower() == sku_code.lower()
+                                or s["sku_id"].lower() == f"sku-{sku_code.lower()}"
+                                or s["name"].lower() == sku_code.lower()
+                                or s["name"].lower() == product_name.lower()
+                            ),
+                            None,
+                        )
                         if not sku:
                             sku = {
-                                "sku_id": f"SKU-{sku_name.upper()}",
-                                "name": sku_name,
+                                "sku_id": sku_code,
+                                "name": product_name,
                                 "inventory_left": 100,
                                 "daily_velocity": 10.0,
                                 "reorder_threshold": 50,
@@ -367,7 +441,12 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                         elif sku["daily_velocity"] > 0:
                             sku["projected_stockout_days"] = round(sku["inventory_left"] / sku["daily_velocity"], 1)
                         
-                        print(f"   📦 SKU '{sku_name}': Stock Left={sku['inventory_left']}, Daily Sales Velocity={sku['daily_velocity']} units/day -> Projected Stockout Days={sku['projected_stockout_days']}", flush=True)
+                        print(
+                            f"   📦 SKU '{product_name}' ({sku_code}): Stock Left={sku['inventory_left']}, "
+                            f"Daily Sales Velocity={sku['daily_velocity']} units/day -> "
+                            f"Projected Stockout Days={sku['projected_stockout_days']}",
+                            flush=True,
+                        )
                             
             # --- 2. Parse meta_ads sheet ---
             # Columns: campaign_name, creative_hook, daily_spend, roas, ctr_percent, frequency, cpa, status
@@ -530,10 +609,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
 
                 blended_aov = 1500.0
                 if revenue_col and len(orders_df) > 0:
-                    revenue_values = pd.to_numeric(orders_df[revenue_col], errors="coerce").dropna()
-                    if len(revenue_values) > 0:
-                        new_state["average_order_value"] = round(float(revenue_values.sum()) / len(orders_df), 2)
-                        blended_aov = new_state["average_order_value"]
+                    revenue_values = pd.to_numeric(orders_df[revenue_col], errors="coerce")
+                    blended = compute_blended_aov(revenue_values)
+                    if blended is not None:
+                        new_state["average_order_value"] = blended
+                        blended_aov = blended
 
                 # Calculate overall brand-level RTO
                 brand_rto, rto_present = calculate_df_rto_rate(orders_df)
@@ -786,10 +866,11 @@ def process_excel_upload_task(self, brand_id: str, upload_source: str, mapping: 
                 revenue_col = next((c for c in df_canonical.columns if c in {"revenue", "total", "amount", "price", "order_value"}), None)
                 blended_aov = 1500.0
                 if revenue_col and len(df_canonical) > 0:
-                    revenue_values = pd.to_numeric(df_canonical[revenue_col], errors="coerce").dropna()
-                    if len(revenue_values) > 0:
-                        new_state["average_order_value"] = round(float(revenue_values.sum()) / len(df_canonical), 2)
-                        blended_aov = new_state["average_order_value"]
+                    revenue_values = pd.to_numeric(df_canonical[revenue_col], errors="coerce")
+                    blended = compute_blended_aov(revenue_values)
+                    if blended is not None:
+                        new_state["average_order_value"] = blended
+                        blended_aov = blended
 
                 # Calculate overall brand RTO rate for single sheet
                 brand_rto, rto_present = calculate_df_rto_rate(df_canonical)

@@ -27,6 +27,7 @@ interface OpentraStore extends OperationalState {
   setMappingOpen: (open: boolean) => void;
   updateDecisionState: (id: string, state: DecisionState) => void;
   selectRemedy: (id: string, remedy: RemedyAction) => void;
+  deleteDecision: (id: string) => Promise<void>;
   selectedDecision: () => Decision | undefined;
   
   // Asynchronous API Actions
@@ -150,7 +151,28 @@ export const useOpentraStore = create<OpentraStore>((set, get) => ({
       body: JSON.stringify({ remedy_id: remedy.id, remedy_label: remedy.label })
     }).catch((err) => console.error("Failed to sync remedy to backend:", err));
   },
-  
+
+  deleteDecision: async (id) => {
+    const current = get();
+    const remaining = current.decisions.filter((decision) => decision.id !== id);
+    const nextSelected =
+      current.selectedDecisionId === id ? remaining[0]?.id || "" : current.selectedDecisionId;
+
+    set({
+      decisions: remaining,
+      selectedDecisionId: nextSelected,
+    });
+
+    try {
+      const res = await fetch(`${API_URL}/decisions/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete decision");
+    } catch (err) {
+      console.error("Failed to delete decision on backend:", err);
+      await get().loadInitialState();
+      set({ error: "Failed to delete decision. The feed was refreshed." });
+    }
+  },
+
   selectedDecision: () => get().decisions.find((decision) => decision.id === get().selectedDecisionId) || undefined,
   
   setSelectedFile: (file) => set({ selectedFile: file }),

@@ -394,6 +394,20 @@ def select_decision_remedy(decision_id: str, payload: DecisionRemedyRequest, db:
     return {"decision_id": decision.id, "state": decision.state, "selectedRemedyId": payload.remedy_id}
 
 
+@app.delete("/decisions/{decision_id}")
+def delete_decision(decision_id: str, db: Session = Depends(get_db)) -> dict:
+    decision = db.get(Decision, decision_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="Decision not found")
+
+    db.query(VerificationScorecard).filter(VerificationScorecard.decision_id == decision_id).delete()
+    db.query(Intervention).filter(Intervention.decision_id == decision_id).delete()
+    db.query(OntologyEdge).filter(OntologyEdge.source_decision_id == decision_id).delete()
+    db.delete(decision)
+    db.commit()
+    return {"status": "success", "decision_id": decision_id}
+
+
 @app.post("/decisions/{decision_id}/state")
 def update_decision_state(decision_id: str, payload: DecisionStateRequest, db: Session = Depends(get_db)) -> dict:
     from sqlalchemy.orm.attributes import flag_modified

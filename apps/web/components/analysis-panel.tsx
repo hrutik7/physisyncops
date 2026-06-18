@@ -18,6 +18,7 @@ import { AutoResolutionCard } from "./decision-v2/auto-resolution-card";
 import { StockoutScenariosCard } from "./decision-v2/stockout-scenarios-card";
 import { VerificationLoop } from "./decision-v2/verification-loop";
 import { RemediesModal } from "./decision-v2/remedies-modal";
+import { DeleteDecisionButton } from "./decision-v2/delete-decision-button";
 import { RootCauseAnalysis } from "./decision-v2/root-cause-analysis";
 
 const iconBySignal = {
@@ -57,6 +58,7 @@ export function AnalysisPanel() {
   const setSelectedDecision = useOpentraStore((state) => state.setSelectedDecision);
   const updateDecisionState = useOpentraStore((state) => state.updateDecisionState);
   const selectRemedy = useOpentraStore((state) => state.selectRemedy);
+  const deleteDecision = useOpentraStore((state) => state.deleteDecision);
   const [showModal, setShowModal] = useState(false);
   const [showRemedies, setShowRemedies] = useState(false);
 
@@ -77,7 +79,7 @@ export function AnalysisPanel() {
     <aside className="thin-scrollbar h-screen overflow-y-auto border-l border-[#ebe8f5] bg-white p-4">
       <div className="rounded-xl border border-[#e6e8f0] bg-white shadow-[0_18px_55px_rgba(38,35,64,0.06)]">
         <div className="flex items-center justify-between border-b border-[#edf0f6] px-4 py-4">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
             <h2 className="text-base font-semibold text-[#101426]">Decision Details</h2>
             <button
               type="button"
@@ -88,6 +90,14 @@ export function AnalysisPanel() {
             >
               <Eye size={18} />
             </button>
+            <DeleteDecisionButton
+              compact
+              onDelete={async () => {
+                await deleteDecision(decision.id);
+                setShowRemedies(false);
+                setShowModal(false);
+              }}
+            />
           </div>
           <button
             type="button"
@@ -355,6 +365,7 @@ function LifecycleActions({
 }
 
 function AnalysisModal({ decision, onClose }: { decision: Decision; onClose: () => void }) {
+  const deleteDecision = useOpentraStore((state) => state.deleteDecision);
   const Icon = iconBySignal[decision.signalType as keyof typeof iconBySignal] || PackageOpen;
   const remedies = decision.remedies || [];
 
@@ -409,7 +420,13 @@ function AnalysisModal({ decision, onClose }: { decision: Decision; onClose: () 
           {decision.outcomeMeasurement ? <VerificationLoop outcome={decision.outcomeMeasurement} /> : null}
         </div>
 
-        <div className="border-t border-[#edf0f6] bg-[#fbfaff] px-6 py-4 flex justify-end">
+        <div className="border-t border-[#edf0f6] bg-[#fbfaff] px-6 py-4 flex items-center justify-between gap-3">
+          <DeleteDecisionButton
+            onDelete={async () => {
+              await deleteDecision(decision.id);
+              onClose();
+            }}
+          />
           <button type="button" onClick={onClose} className="rounded-lg bg-[#4320c2] px-5 py-2.5 text-sm font-bold text-white hover:bg-[#3417a2]">
             Close Analysis
           </button>

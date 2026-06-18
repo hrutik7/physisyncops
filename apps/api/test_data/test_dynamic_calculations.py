@@ -121,7 +121,7 @@ def test_dynamic_calculations():
         # Revenue at risk = daily_velocity (5.0) * SKU AOV (4000.0) * (7 - stockout (2.0))
         # = 5.0 * 4000.0 * 5.0 = 100,000
         assert inv_sig.business_impact == 100000, f"Expected business impact of 100,000, got {inv_sig.business_impact}"
-        assert "SKU-level AOV is Rs 4,000.00" in inv_sig.cross_system_signals, "Expected SKU-level AOV in cross system signals"
+        assert "SKU-level AOV: Rs 4,000.00" in inv_sig.cross_system_signals, "Expected SKU-level AOV in cross system signals"
         print("✅ Rule Engine integration with SKU-level AOV passed!")
  
         # 5. Test Same-Name SKU AOV Fallback
@@ -162,7 +162,7 @@ def test_dynamic_calculations():
         # Stockout days = 7.0 - 2.0 = 5.0
         # Revenue at risk = 1.0 * 1500.0 * 5.0 = 7500
         assert f_sig.business_impact == 7500, f"Expected business impact of 7500 (using same-name SKU AOV), got {f_sig.business_impact}"
-        assert "SKU-level AOV is Rs 1,500.00" in f_sig.cross_system_signals, "Expected same-name fallback AOV in signals"
+        assert "SKU-level AOV: Rs 1,500.00" in f_sig.cross_system_signals, "Expected same-name fallback AOV in signals"
         print("✅ Same-name SKU AOV fallback passed!")
 
         # Clean up database

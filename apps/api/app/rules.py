@@ -15,6 +15,26 @@ from .impact_math import (
 
 DEFAULT_AVERAGE_ORDER_VALUE = 500
 
+INVENTORY_PLACEHOLDER_NAMES = {
+    "code",
+    "type",
+    "color",
+    "size",
+    "sr no.",
+    "sr no",
+    "usable stock",
+    "damaged stock",
+    "average",
+    "nan",
+}
+
+
+def is_inventory_placeholder_sku(sku: dict[str, Any]) -> bool:
+    name = str(sku.get("name", "")).strip().lower()
+    sku_id = str(sku.get("sku_id", "")).strip().lower()
+    return name in INVENTORY_PLACEHOLDER_NAMES or sku_id in INVENTORY_PLACEHOLDER_NAMES
+
+
 SIGNAL_THRESHOLDS = {
     "InventoryRisk": {"projected_stockout_days_max": 7, "spend_growth_percent_min": 15, "severity": "high", "confidence": 0.75},
     "CreativeFatigue": {"frequency_min": 4, "ctr_drop_percent_min": 20, "ctr_max_without_baseline": 0.8, "severity": "medium", "confidence": 0.76},
@@ -307,12 +327,22 @@ class SignalDetectionEngine:
                 campaign["roas_on_delivered_orders"] = round(placed_roas * discount_factor * (1 - (rto_rate / 100)), 2)
 
         # --- RULE EVALUATION ---
+        inventory_candidates: dict[str, tuple[float, Signal]] = {}
         for sku in skus:
             sku = normalize_sku_metrics(sku)
+            if is_inventory_placeholder_sku(sku):
+                continue
+
             thresholds = SIGNAL_THRESHOLDS["InventoryRisk"]
             projected = sku["projected_stockout_days"]
             spend_growth = float(sku.get("spend_growth_percent", 0) or 0)
-            
+            daily_velocity = float(sku.get("daily_velocity", 0) or 0)
+            sku_level_aov = sku.get("average_order_value")
+            has_order_history = bool(sku_level_aov and float(sku_level_aov) > 0)
+
+            if daily_velocity <= 0 and not has_order_history:
+                continue
+
             is_cliff = projected <= 3.0
             is_growth_risk = projected <= thresholds["projected_stockout_days_max"] and spend_growth >= thresholds["spend_growth_percent_min"]
             
@@ -333,9 +363,11 @@ class SignalDetectionEngine:
                         ]
                         if same_name_skus:
                             sku_aov = sum(float(s["average_order_value"]) for s in same_name_skus) / len(same_name_skus)
+                aov_is_brand_fallback = False
                 if not sku_aov or float(sku_aov) == 0.0:
                     sku_aov = average_order_value
-                
+                    aov_is_brand_fallback = True
+
                 impact_metrics = compute_inventory_revenue_impact(
                     sku["daily_velocity"],
                     float(sku_aov),
@@ -373,48 +405,58 @@ class SignalDetectionEngine:
                 severity = "high" if (is_cliff or is_out_of_stock) else thresholds["severity"]
                 rule = "projected_stockout_days <= 3.0" if (is_cliff or is_out_of_stock) else "projected_stockout_days <= 7 AND spend_growth_percent >= 15"
                 
-                signals.append(
-                    Signal(
-                        title=f"{title_prefix}: {sku['name']} under {projected} days of cover",
-                        signal_type="InventoryRisk",
-                        issue_type="Inventory pressure",
-                        severity=severity,
-                        confidence_score=conf_score,
-                        business_impact=revenue_at_risk,
-                        impact_label=impact_label,
-                        recommendation="Submit a priority restock order immediately. Reduce prospecting spend until inbound inventory is confirmed.",
-                        affected_campaigns=sku.get("campaigns", []),
-                        affected_skus=[sku["name"]],
-                        rule=rule,
-                        explanation=explanation,
-                        cross_system_signals=[
-                            f"Inventory left: {sku['inventory_left']} units",
-                            f"Daily velocity: {sku['daily_velocity']} units/day",
-                            f"Inventory cover: {projected} days",
-                            f"Spend growth: {spend_growth:.1f}%",
-                            f"SKU-level AOV: Rs {sku_aov:,.2f}",
-                        ],
-                        risk_projection=[
-                            {"horizon": "24 hr", "impact": "Inventory cover falls further"},
-                            {"horizon": "48 hr", "impact": "Reorder window becomes operationally tight"},
-                            {"horizon": "72 hr", "impact": "Paid traffic drives demand into hard stockout"}
-                        ],
-                        recommended_actions=[
-                            f"Submit priority restock for {sku['name']}",
-                            "Reduce prospecting spend by 15%",
-                            "Pause ads on out-of-stock risk SKUs",
-                        ],
-                        verification_signals=[
-                            {
-                                "label": "Inventory reorder verification",
-                                "condition": f"inventory level increases >= {VERIFICATION_THRESHOLDS['inventoryReorder']['inventory_level_increase_min']}% AND projected stockout days improves >= {VERIFICATION_THRESHOLDS['inventoryReorder']['projected_stockout_days_improvement_min']}",
-                                "confidence": VERIFICATION_THRESHOLDS['inventoryReorder']['confidence']
-                            }
-                        ],
-                        confidence_explanation=conf_expl,
-                        relationship_edges=OntologyLayer.build_relationships("InventoryRisk", [sku["name"], *(sku.get("campaigns", [])[:1])], sku)
-                    )
+                candidate = Signal(
+                    title=f"{title_prefix}: {sku['name']} under {projected} days of cover",
+                    signal_type="InventoryRisk",
+                    issue_type="Inventory pressure",
+                    severity=severity,
+                    confidence_score=conf_score,
+                    business_impact=revenue_at_risk,
+                    impact_label=impact_label,
+                    recommendation="Submit a priority restock order immediately. Reduce prospecting spend until inbound inventory is confirmed.",
+                    affected_campaigns=sku.get("campaigns", []),
+                    affected_skus=[sku["name"]],
+                    rule=rule,
+                    explanation=explanation,
+                    cross_system_signals=[
+                        f"Inventory left: {sku['inventory_left']} units",
+                        f"Daily velocity: {sku['daily_velocity']} units/day",
+                        f"Inventory cover: {projected} days",
+                        f"Spend growth: {spend_growth:.1f}%",
+                        (
+                            f"SKU-level AOV: Rs {sku_aov:,.2f}"
+                            if not aov_is_brand_fallback
+                            else f"Brand-level AOV (fallback): Rs {sku_aov:,.2f}"
+                        ),
+                    ],
+                    risk_projection=[
+                        {"horizon": "24 hr", "impact": "Inventory cover falls further"},
+                        {"horizon": "48 hr", "impact": "Reorder window becomes operationally tight"},
+                        {"horizon": "72 hr", "impact": "Paid traffic drives demand into hard stockout"},
+                    ],
+                    recommended_actions=[
+                        f"Submit priority restock for {sku['name']}",
+                        "Reduce prospecting spend by 15%",
+                        "Pause ads on out-of-stock risk SKUs",
+                    ],
+                    verification_signals=[
+                        {
+                            "label": "Inventory reorder verification",
+                            "condition": f"inventory level increases >= {VERIFICATION_THRESHOLDS['inventoryReorder']['inventory_level_increase_min']}% AND projected stockout days improves >= {VERIFICATION_THRESHOLDS['inventoryReorder']['projected_stockout_days_improvement_min']}",
+                            "confidence": VERIFICATION_THRESHOLDS['inventoryReorder']['confidence'],
+                        }
+                    ],
+                    confidence_explanation=conf_expl,
+                    relationship_edges=OntologyLayer.build_relationships(
+                        "InventoryRisk", [sku["name"], *(sku.get("campaigns", [])[:1])], sku
+                    ),
                 )
+                product_key = sku["name"].strip().lower()
+                prior = inventory_candidates.get(product_key)
+                if prior is None or projected < prior[0]:
+                    inventory_candidates[product_key] = (projected, candidate)
+
+        signals.extend(signal for _, signal in inventory_candidates.values())
 
         rto_data_present = state.get("rto_data_present", True)
         if not rto_data_present:

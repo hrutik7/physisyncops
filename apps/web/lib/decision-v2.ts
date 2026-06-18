@@ -832,5 +832,23 @@ export function effortTone(effort: string) {
   return "border-[#ffe7ba] bg-[#fff8e8] text-[#b86d00]";
 }
 
+export function effortMeta(effort: string) {
+  if (effort === "low") {
+    return { score: 1, deployTime: "Same day", complexity: "Quick operational change" };
+  }
+  if (effort === "high") {
+    return { score: 3, deployTime: "1+ week", complexity: "Cross-team coordination required" };
+  }
+  return { score: 2, deployTime: "2–3 days", complexity: "Moderate setup and monitoring" };
+}
+
+export function remedyImpactShare(remedies: { expectedRiskReduction: number }[], remedy: { expectedRiskReduction: number }) {
+  const max = Math.max(...remedies.map((item) => item.expectedRiskReduction), 1);
+  return Math.round((remedy.expectedRiskReduction / max) * 100);
+}
+
+export const IMPACT_SHARE_EXPLANATION =
+  "Impact share compares remedies for this decision only. Each option's expected value is modeled as decision impact × capture rate. Impact share = this remedy's expected value ÷ the highest expected value among the listed options × 100. The top option is always 100%; others are relative to that.";
+
 export const DEFAULT_RECOVERY_EXPLANATION =
   "Modeled value derived from the revenue gap and expected impact of the selected intervention — protective for hold-and-validate actions, improvement-oriented for active changes.";

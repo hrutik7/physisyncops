@@ -1506,6 +1506,28 @@ def build_decision_verification(decision: Decision, snapshot: BusinessSnapshot |
             "reason": " and ".join(reasons) + "." if reasons else "Sample size limits statistical certainty for this regional RTO signal.",
         }
 
+    if signal == "InventoryRisk":
+        sku = _sku_metrics(snapshot, decision.affected_skus or [])
+        velocity = float(sku.get("daily_velocity", 0) or 0) if sku else 0.0
+        if evidence["allRequiredAvailable"] and sku and velocity > 0:
+            return {
+                "type": "verified",
+                "label": "Verified Decision",
+                "reason": "Inventory levels and recent sales velocity are confirmed from the latest upload.",
+            }
+        reasons: list[str] = []
+        if not sku or velocity <= 0:
+            reasons.append("recent sales velocity unavailable")
+        if not evidence["allRequiredAvailable"]:
+            reasons.append("required inventory evidence is incomplete")
+        if snapshot and snapshot.snapshot_version <= 1:
+            reasons.append("historical velocity baseline unavailable")
+        return {
+            "type": "estimated",
+            "label": "Estimated Decision",
+            "reason": " and ".join(reasons) + "." if reasons else "Inbound PO and supplier ETA data are unavailable.",
+        }
+
     if evidence["allRequiredAvailable"] and campaign_rto_verified:
         return {
             "type": "verified",
